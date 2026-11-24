@@ -333,7 +333,7 @@ class DirectColabRuntime:
             # raises instead of waiting for the full execution timeout.
             received.set()
 
-    async def close(self) -> None:
+    async def close(self, shutdown_kernel: bool = False) -> None:
         client = self._kernel_client
         self._kernel_client = None
         if client is None:
@@ -347,6 +347,11 @@ class DirectColabRuntime:
                     manager_client.kernel_socket.close()
             except Exception:  # pragma: no cover - cleanup must be best effort
                 logger.debug("Error closing direct Colab runtime", exc_info=True)
+            if shutdown_kernel:
+                try:
+                    client._manager.shutdown_kernel(now=True, timeout=15)
+                except Exception:  # pragma: no cover - the runtime may be gone
+                    logger.debug("Error shutting down side kernel", exc_info=True)
 
         await asyncio.to_thread(stop)
 
@@ -369,6 +374,11 @@ class DirectRuntimeManager:
         self.last_endpoint: str | None = None
         self.records: dict[str, RuntimeRecord] = {}
         self._keep_alive_task: asyncio.Task | None = None
+        # A second kernel on the same runtime for shell commands, file listing
+        # and transfers, so they still work while a cell keeps the main
+        # kernel busy.  Created on first use and shut down on close().
+        self.side_runtime: DirectColabRuntime | None = None
+        self._side_lock = asyncio.Lock()
 
     # -- bookkeeping -------------------------------------------------------
 
@@ -494,8 +504,11 @@ class DirectRuntimeManager:
         if not self.keep_alive_enabled:
             rec.keep_alive_state = "off"
             return rec.keep_alive_state
-        runtime = self.runtime
-        idle = 0.0 if runtime is None or runtime.busy else time.time() - runtime.last_activity
+        kernels = [k for k in (self.runtime, self.side_runtime) if k is not None]
+        if not kernels or any(k.busy for k in kernels):
+            idle = 0.0
+        else:
+            idle = time.time() - max(k.last_activity for k in kernels)
         if idle > self.keep_alive_idle_limit:
             rec.keep_alive_state = (
                 f"paused after {int(self.keep_alive_idle_limit // 60)} min without MCP activity"
@@ -602,8 +615,32 @@ class DirectRuntimeManager:
         await self.close()
         await self._attach(target)
 
+    async def side(self) -> DirectColabRuntime:
+        """The side kernel on the current runtime, started on first use."""
+        if not self.connected:
+            await self.connect()
+        async with self._side_lock:
+            main = self.runtime
+            side = self.side_runtime
+            if side is not None and side.target == main.target and side.connected:
+                return side
+            if side is not None:
+                await side.close(shutdown_kernel=True)
+                self.side_runtime = None
+            side = DirectColabRuntime(
+                main.target,
+                self._assignment_check_for(main.target.endpoint),
+                lambda: self.explain_loss(main.target.endpoint),
+            )
+            await side.connect()
+            self.side_runtime = side
+            return side
+
     async def close(self) -> None:
         await self._stop_keep_alive()
+        if self.side_runtime is not None:
+            await self.side_runtime.close(shutdown_kernel=True)
+            self.side_runtime = None
         if self.runtime is not None:
             await self.runtime.close()
         self.runtime = None

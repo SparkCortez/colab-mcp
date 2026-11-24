@@ -97,6 +97,8 @@ class TestDirectTools:
                 "run_code_cell_blocking",
                 "get_code_execution",
                 "list_code_executions",
+                "run_shell",
+                "shell_job",
             }
 
     @pytest.mark.asyncio

@@ -281,3 +281,66 @@ async def test_released_runtime_names_the_tool():
     manager.note_released("ep", "stop_runtime")
     message = await manager.explain_loss("ep")
     assert "released by this MCP (stop_runtime)" in message
+
+
+@pytest.fixture
+def fake_kernels(monkeypatch):
+    """Kernels that connect instantly and record how they were closed."""
+    started, closed = [], []
+
+    async def fake_connect(self):
+        self._kernel_client = SimpleNamespace()
+        started.append(self)
+
+    async def fake_close(self, shutdown_kernel=False):
+        self._kernel_client = None
+        closed.append((self, shutdown_kernel))
+
+    monkeypatch.setattr(DirectColabRuntime, "connect", fake_connect)
+    monkeypatch.setattr(DirectColabRuntime, "close", fake_close)
+    return started, closed
+
+
+@pytest.mark.asyncio
+async def test_side_kernel_is_separate_reused_and_shut_down(fake_kernels):
+    started, closed = fake_kernels
+    manager = DirectRuntimeManager(KeepAliveClient(), keep_alive_interval=0)
+
+    side = await manager.side()
+    assert manager.runtime is not side
+    assert side.target == manager.runtime.target
+    assert started == [manager.runtime, side]
+    assert await manager.side() is side
+
+    main = manager.runtime
+    await manager.close()
+    assert (side, True) in closed and (main, False) in closed
+    assert manager.side_runtime is None
+
+
+@pytest.mark.asyncio
+async def test_side_kernel_follows_a_new_runtime(fake_kernels):
+    _started, closed = fake_kernels
+    manager = DirectRuntimeManager(KeepAliveClient(), keep_alive_interval=0)
+    old = await manager.side()
+
+    await manager.attach_target(RuntimeTarget("ep2", "https://other", "t2"))
+    new = await manager.side()
+    assert new is not old
+    assert new.target.endpoint == "ep2"
+    assert (old, True) in closed
+
+
+@pytest.mark.asyncio
+async def test_side_kernel_activity_keeps_runtime_alive():
+    client = KeepAliveClient()
+    manager = _attached(client, keep_alive_idle_limit=60)
+    manager.runtime.last_activity -= 120
+    manager.side_runtime = SimpleNamespace(busy=1, last_activity=manager.runtime.last_activity)
+    assert await manager.keep_alive_tick() == "active"
+    manager.side_runtime.busy = 0
+    assert (await manager.keep_alive_tick()).startswith("paused")
+    import time as _time
+
+    manager.side_runtime.last_activity = _time.time()
+    assert await manager.keep_alive_tick() == "active"

@@ -23,6 +23,7 @@ import os
 import tempfile
 import sys
 import time
+import uuid
 import webbrowser
 
 from fastmcp import FastMCP
@@ -958,15 +959,101 @@ async def remove_account(email: str) -> str:
 
 
 async def _connected_direct_runtime():
-    """Return the connected direct runtime, or an explanatory error string."""
-    if _direct_runtime_manager is None:
+    """Return the runtime's side kernel for file and shell tools, or an error string.
+
+    The side kernel is a second kernel on the same runtime, so these tools keep
+    working while a cell occupies the main kernel.  If it cannot be started the
+    main kernel is used instead.
+    """
+    manager = _direct_runtime_manager
+    if manager is None:
         return "Direct runtime access requires --client-oauth-config."
-    if not _direct_runtime_manager.connected:
+    if not manager.connected:
         try:
-            await _direct_runtime_manager.connect()
+            await manager.connect()
         except DirectRuntimeError as exc:
             return f"Direct Colab runtime connection failed: {exc}"
-    return _direct_runtime_manager.runtime
+    try:
+        return await manager.side()
+    except Exception:
+        logging.getLogger(__name__).warning(
+            "Side kernel unavailable; using the main kernel", exc_info=True
+        )
+        return manager.runtime
+
+
+def _shell_result(outputs) -> dict:
+    from colab_mcp import transfer
+
+    return json.loads(transfer.stdout_text(outputs).strip())
+
+
+@mcp.tool()
+async def run_shell(
+    command: str,
+    cwd: str = "/content",
+    timeout_seconds: float = 300,
+    background: bool = False,
+) -> str:
+    """Run a bash command on the directly connected runtime and return stdout, stderr and exit_code as JSON.
+
+    It runs in a separate side kernel, so it works while a cell is still running in the notebook kernel (check GPU use, tail logs, pip install, etc.). There is no TTY: interactive programs (vim, htop, prompts) do not work; use -y / batch flags.
+
+    A foreground command is killed after timeout_seconds (timed_out: true, partial output kept); only the last 20000 characters of each stream are returned. Shell commands share one side kernel, so a long foreground command delays the next one.
+
+    background=True starts the command detached and returns a job_id at once; its output goes to a log file. Use shell_job to read its state and log tail, list jobs or kill one. Background jobs survive the MCP session but not the runtime.
+    """
+    from colab_mcp import shell
+
+    if not command.strip():
+        return "command is empty."
+    runtime = await _connected_direct_runtime()
+    if isinstance(runtime, str):
+        return runtime
+    try:
+        if background:
+            job_id = uuid.uuid4().hex[:8]
+            outputs = await runtime.execute(
+                shell.start_job_code(job_id, command, cwd), lambda _event: None, timeout=60
+            )
+            info = _shell_result(outputs)
+            info["note"] = f"Started in the background. Check it with shell_job(job_id='{job_id}')."
+            return json.dumps(info, ensure_ascii=False)
+        timeout = max(1.0, float(timeout_seconds))
+        outputs = await runtime.execute(
+            shell.run_code(command, cwd, timeout), lambda _event: None, timeout=timeout + 60
+        )
+        return json.dumps(_shell_result(outputs), ensure_ascii=False)
+    except Exception as e:
+        return f"run_shell failed: {e}"
+
+
+@mcp.tool()
+async def shell_job(job_id: str = "", action: str = "status", tail_lines: int = 50) -> str:
+    """Inspect background jobs started by run_shell(background=True).
+
+    action="status" (default) returns state (running / exited / killed), exit_code, elapsed seconds and the last tail_lines of the log. action="list" lists every job on the runtime (job_id may be empty). action="kill" stops the job's whole process group (SIGTERM, then SIGKILL).
+    """
+    from colab_mcp import shell
+
+    if action not in ("status", "list", "kill"):
+        return "action must be 'status', 'list' or 'kill'."
+    if action != "list" and not job_id:
+        return f"job_id is required for action '{action}'."
+    runtime = await _connected_direct_runtime()
+    if isinstance(runtime, str):
+        return runtime
+    if action == "list":
+        code = shell.job_list_code()
+    elif action == "kill":
+        code = shell.job_kill_code(job_id)
+    else:
+        code = shell.job_status_code(job_id, max(0, tail_lines))
+    try:
+        outputs = await runtime.execute(code, lambda _event: None, timeout=60)
+        return json.dumps(_shell_result(outputs), ensure_ascii=False)
+    except Exception as e:
+        return f"shell_job failed: {e}"
 
 
 def _drive_session_for_transfer(force: bool):
