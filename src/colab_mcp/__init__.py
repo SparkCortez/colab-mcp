@@ -57,7 +57,8 @@ _client_oauth_config: str | None = None
 # _colab_client/_direct_runtime_manager always point at the active account's pair.
 _accounts: dict[str, tuple[object, DirectRuntimeManager]] = {}
 _active_account: str | None = None
-_change_runtime_lock = asyncio.Lock()
+# One lock per account, so a slow assignment on one account never blocks another.
+_change_runtime_locks: dict[str | None, asyncio.Lock] = {}
 # (account, accelerator) -> notebook hash of an assignment still in progress.
 _pending_assignments: dict[tuple[str | None, str], str] = {}
 _keep_alive_interval = KEEP_ALIVE_INTERVAL_SECONDS
@@ -562,12 +563,12 @@ def _keep_alive_summary(manager) -> str:
     )
 
 
-async def _release_runtime(endpoint: str, accelerator: str, by: str) -> str:
-    if _direct_runtime_manager is not None:
-        _direct_runtime_manager.note_released(endpoint, by)
-        if _direct_runtime_manager.endpoint == endpoint:
-            await _direct_runtime_manager.close()
-    await asyncio.to_thread(_colab_client.unassign, endpoint)
+async def _release_runtime(client, manager, endpoint: str, accelerator: str, by: str) -> str:
+    if manager is not None:
+        manager.note_released(endpoint, by)
+        if manager.endpoint == endpoint:
+            await manager.close()
+    await asyncio.to_thread(client.unassign, endpoint)
     return f"Released previous runtime {endpoint} ({accelerator}). "
 
 
@@ -591,11 +592,13 @@ async def change_runtime(accelerator: str = "T4", force_new: bool = False) -> st
     except ValueError:
         return f"Unknown accelerator '{accelerator}'. Use NONE, T4, L4 or A100."
     variant = Variant.GPU if acc != Accelerator.NONE else Variant.DEFAULT
-    manager = _direct_runtime_manager
+    # Pin the account for the whole call: switch_account may run while Colab
+    # is still answering, and every later step must stay on this account.
+    client, manager, account = _colab_client, _direct_runtime_manager, _active_account
 
-    async with _change_runtime_lock:
+    async with _change_runtime_locks.setdefault(account, asyncio.Lock()):
         try:
-            assignments = await asyncio.to_thread(_colab_client.list_assignments) or []
+            assignments = await asyncio.to_thread(client.list_assignments) or []
             own_endpoint = None
             if manager is not None:
                 own_endpoint = manager.endpoint or manager.last_endpoint
@@ -617,13 +620,13 @@ async def change_runtime(accelerator: str = "T4", force_new: bool = False) -> st
 
             # One notebook hash per (account, accelerator) until it succeeds, so a
             # retry after a timeout picks up the runtime Colab created meanwhile.
-            key = (_active_account, acc.value)
+            key = (account, acc.value)
             notebook_hash = _pending_assignments.setdefault(key, str(uuid.uuid4()))
             released = ""
             try:
                 try:
                     result = await asyncio.to_thread(
-                        _colab_client.assign, notebook_hash, variant, acc
+                        client.assign, notebook_hash, variant, acc
                     )
                 except TooManyAssignmentsError:
                     if own is None:
@@ -638,11 +641,12 @@ async def change_runtime(accelerator: str = "T4", force_new: bool = False) -> st
                         )
                     # Make room by releasing this session's own runtime, then retry.
                     released = await _release_runtime(
+                        client, manager,
                         own.endpoint, own.accelerator.value, f"change_runtime to {acc.value}"
                     )
                     own = None
                     result = await asyncio.to_thread(
-                        _colab_client.assign, notebook_hash, variant, acc
+                        client.assign, notebook_hash, variant, acc
                     )
             except (
                 requests.exceptions.Timeout,
@@ -682,7 +686,7 @@ async def change_runtime(accelerator: str = "T4", force_new: bool = False) -> st
 
             if own is not None and own.endpoint != endpoint:
                 released = await _release_runtime(
-                    own.endpoint, own.accelerator.value, f"change_runtime to {acc.value}"
+                    client, manager, own.endpoint, own.accelerator.value, f"change_runtime to {acc.value}"
                 )
             fit_text = f"Idle timeout: {fit} s. " if fit else ""
 
@@ -690,7 +694,7 @@ async def change_runtime(accelerator: str = "T4", force_new: bool = False) -> st
                 # The assignment response in older Colab API variants does not
                 # always include runtimeProxyInfo. Refresh the assignment list to
                 # obtain the current short-lived URL/token pair.
-                listed = await asyncio.to_thread(_colab_client.list_assignments)
+                listed = await asyncio.to_thread(client.list_assignments)
                 selected = next(
                     (item for item in listed or [] if item.endpoint == endpoint), None
                 )

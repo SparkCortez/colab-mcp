@@ -596,3 +596,27 @@ class TestChangeRuntimeIdempotent:
         client.assign.side_effect = ColabRequestError("403 Forbidden", None, response)
         result = await colab_mcp.change_runtime.fn("L4")
         assert result.startswith("Failed to change runtime") and "403" in result
+
+    @pytest.mark.asyncio
+    async def test_switch_account_mid_call_stays_on_original_account(self, env, monkeypatch):
+        from colab_mcp.client import Accelerator
+        colab_mcp, client, manager = env
+        other_client = Mock()
+        new = Mock(endpoint="new", accelerator=Accelerator.L4)
+        client.list_assignments.side_effect = [
+            [Mock(endpoint="mine", accelerator=Accelerator.T4)],
+            [new],
+        ]
+
+        def assign(*args):
+            # Another tool call switches the session while Colab is answering.
+            colab_mcp._colab_client = other_client
+            colab_mcp._direct_runtime_manager = Mock()
+            return Mock(endpoint="new", idle_timeout_sec=1800)
+
+        client.assign.side_effect = assign
+        await colab_mcp.change_runtime.fn("L4")
+        client.unassign.assert_called_once_with("mine")
+        manager.attach_target.assert_awaited_once()
+        other_client.unassign.assert_not_called()
+        other_client.list_assignments.assert_not_called()
