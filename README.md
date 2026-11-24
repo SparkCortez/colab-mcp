@@ -32,7 +32,7 @@ available for notebook UI operations and compatibility.
 - 既存のColabタブへ手動接続するための明示的な準備（ブラウザを開かずColab入力用の`TOKEN&PORT`を取得）
 - OAuthを設定した場合のT4、L4、A100、NONEランタイムの割り当て
 
-現在のMCPツールは14個です。接続3個、セル操作6個、実行・状態確認4個、ランタイム変更1個で構成されます。既存タブへ手動接続する場合は`prepare_colab_browser_connection`を呼び、返された`TOKEN&PORT`文字列をColabの「MCPプロキシトークン」欄へ入力します。このツールはブラウザを開かず、接続完了まで待ちません。セル追加の`cellIndex`は必須で、`-1`を指定すると末尾へ追加します。省略した場合は実行されません。セル操作では`add_code_cell`または`get_cells`で得た`cellId`を使います。標準の`run_code_cell`はすぐに`execution_id`を返し、従来どおり完了まで待つ必要がある場合だけ`run_code_cell_blocking`を使います。
+現在のMCPツールは28個です。アカウント管理4個、接続3個、セル操作6個、実行・状態確認4個、ランタイム管理4個（変更・停止・一覧・keep-alive）、ファイル転送・管理6個、ノートブック作成1個で構成されます。既存タブへ手動接続する場合は`prepare_colab_browser_connection`を呼び、返された`TOKEN&PORT`文字列をColabの「MCPプロキシトークン」欄へ入力します。このツールはブラウザを開かず、接続完了まで待ちません。セル追加の`cellIndex`は必須で、`-1`を指定すると末尾へ追加します。省略した場合は実行されません。セル操作では`add_code_cell`または`get_cells`で得た`cellId`を使います。標準の`run_code_cell`はすぐに`execution_id`を返し、従来どおり完了まで待つ必要がある場合だけ`run_code_cell_blocking`を使います。
 
 ### 公式版との比較・このミラーの改善
 
@@ -159,7 +159,7 @@ retains incremental kernel output in a bounded event buffer; poll
 `get_code_execution` with `cursor` (and optionally `wait_seconds`) to read new
 output without waiting for the cell to finish.
 
-There are 14 registered tools. They are available to the MCP client at startup,
+There are 28 registered tools. They are available to the MCP client at startup,
 even before a browser has connected; notebook calls return an explicit
 `COLAB_NOT_CONNECTED` message until a connection is established.
 
@@ -178,7 +178,21 @@ even before a browser has connected; notebook calls return an explicit
 | `move_cell` | Yes | | Move a cell by `cellId` |
 | `get_code_execution` | | | Poll status and incremental output using `cursor`/`wait_seconds` |
 | `list_code_executions` | | | List retained background executions |
-| `change_runtime` | | Yes | Assign a `T4`, `L4`, `A100`, or `NONE` runtime |
+| `change_runtime` | | Yes | Assign a `T4`, `L4`, `A100`, or `NONE` runtime. Reuses this session's runtime when it already has that accelerator (`force_new=true` to replace); assigns the new one before releasing the old; a timed-out call can be repeated without creating a second runtime |
+| `set_keep_alive` | | Yes | Turn the runtime keep-alive on/off and set its interval and idle limit |
+| `stop_runtime` | | Yes | Unassign this session's runtime (default), one `runtime_endpoint`, or every runtime with `all_runtimes=true` |
+| `list_runtimes` | | Yes | List active runtimes (accelerator, direct connection, idle timeout `fit`, keep-alive state, last seen alive) plus compute-unit balance and hourly burn |
+| `list_accounts` | | Yes | List signed-in Google accounts, the session's active one, the default, and each account's runtimes and compute units |
+| `add_account` | | Yes | Sign in another Google account through the browser account chooser; it becomes the active account |
+| `switch_account` | | Yes | Point runtime, file and notebook tools at another signed-in account (`make_default` for new sessions) |
+| `remove_account` | | Yes | Delete a non-active account's saved tokens |
+| `upload_to_runtime` | No | Yes | Copy a local file (≤ 1 GiB) to the runtime, default `/content/<name>` |
+| `download_from_runtime` | No | Yes | Copy a runtime file (≤ 1 GiB) back, default `~/Downloads/colab/<name>` |
+| `upload_files_to_runtime` | No | Yes | Upload several files/directories (globs allowed) to `remote_dir` as one compressed batch |
+| `download_files_from_runtime` | No | Yes | Download several runtime files/directories (globs allowed) into `local_dir` as one compressed batch |
+| `list_runtime_files` | No | Yes | List runtime files with type, size and modification time (optionally recursive) |
+| `delete_runtime_files` | No | Yes | Delete runtime files/directories matching paths or globs |
+| `create_notebook` | No | Yes | Create a Colab notebook in Drive (optional cells and default GPU); first call asks for `drive.file` consent |
 
 `*` Direct execution requires `--client-oauth-config` and an active runtime.
 Calling `open_colab_browser_connection` with OAuth configured attaches to the
@@ -199,14 +213,14 @@ optional capabilities:
 
 | Area | Official baseline | This mirror |
 |------|-------------------|-------------|
-| Tool discovery | Notebook tools appear after browser connection and may require `notifications/tools/list_changed` | All 14 tools are registered at process startup |
+| Tool discovery | Notebook tools appear after browser connection and may require `notifications/tools/list_changed` | All 28 tools are registered at process startup |
 | Existing notebooks and tabs | Connection flow primarily opens a new URL/tab | Accepts an existing HTTPS `notebook_url`; `open_new_tab=false` prepares a URL for an existing tab |
 | Process lifecycle | A stale process can leave a tab pointed at a dead port | Registry + OS process scan; PID, start time, command, and profile are checked before cleanup, and timed-out peers are marked for safe retry cleanup |
 | Local browser connection | `localhost` dual-stack binding and missing PNA response headers can make Chrome fail to reach the server | IPv4-only `127.0.0.1` binding plus PNA/CORS headers on preflight and WebSocket upgrade |
 | Long-running cells | A cell call occupies the client until completion | `run_code_cell` returns an execution ID immediately; `get_code_execution` and `list_code_executions` provide bounded, process-local tracking; `run_code_cell_blocking` preserves opt-in waiting |
 | Runtime/GPU control | The upstream runtime flag/API is not available in the baseline | Optional OAuth-backed `change_runtime` for T4, L4, A100, or NONE |
 | OAuth token handling | Not provided by the upstream baseline | Cached locally and refreshed as needed |
-| Windows OAuth callback | The default callback port can be blocked | Uses port `8085` |
+| Windows OAuth callback | The default callback port can be blocked | Uses a random free loopback port (was `8085`) |
 | Colab API initialization | Missing required environment argument in the baseline | Supplies the required `Prod()` environment |
 | Multiple clients | Default client-launched processes are isolated | Streamable HTTP daemon lets multiple MCP clients share one browser connection and execution registry |
 
@@ -568,6 +582,27 @@ command line and start time still match the recorded PID.
 - Do not define the same MCP endpoint twice for one client (for example, in both its global and project config). Claude and Codex may each have one shared-daemon entry.
 - Restart your editor after changing `.mcp.json`
 
+### Large file transfers are slow
+
+The kernel route sends base64 through one websocket to a runtime that is often on another continent (measured 0.75 MB/s upload from Indonesia on a 3.8 MB/s line). The four upload/download tools therefore take `via`: with `auto` (default) files of 20 MB or more go laptop ↔ Google Drive ↔ runtime when the active account has granted Drive (`drive.file`) access, with the temporary Drive file deleted afterwards (measured 2.6 MB/s up, 2.8 MB/s down for 64 MB). `via="drive"` grants that access once; `via="kernel"` forces the old route.
+
+### Runtime disappears after ~20-30 minutes without calls
+
+Colab reclaims a runtime it considers idle; the assignment's `fit` (shown by `change_runtime` and `list_runtimes`) is that limit, 1800 s for a free T4. While this MCP is connected to a runtime it pings Colab's tunnel keep-alive endpoint (`GET /tun/m/<endpoint>/keep-alive/` with `X-Colab-Tunnel: Google`, as the Colab VS Code extension does) every 5 minutes, as long as the runtime was used in the last 60 minutes. Change this with `set_keep_alive` or `--keep-alive-interval <seconds>` / `--keep-alive-idle-limit <minutes>` (0 disables). Keep-alive cannot override usage limits: if a runtime still vanishes while pings succeed, the error says so and shows the compute-unit balance.
+
+### Using several Google accounts
+
+Tokens live in `~/.config/colab-mcp/accounts/<email>.json` (plus `<email>.drive.json` once `create_notebook` is used). On first start, the old single-account token `~/.colab-mcp-auth-token.json` is copied there and becomes the default. Call `add_account` to sign in another account, `list_accounts` to compare compute units, and `switch_account` to move this session to another account. Each session has its own active account; new sessions start with the default (`~/.config/colab-mcp/default_account`).
+
+### A background execution fails with "no longer assigned" / "Lost the connection"
+
+Direct executions are watched while they run. If the websocket stays down for
+30 seconds, or Colab stops listing the runtime (checked every 60 seconds), the
+execution is marked `failed` with that reason instead of staying `running`.
+Typical causes are `stop_runtime`/`change_runtime` from another session, the
+idle timeout, or Colab reclaiming a free-tier VM. Output produced after that
+point is lost; check `list_runtimes` and start a new runtime.
+
 ### `change_runtime` returns "Runtime API not initialized"
 - Check that `--client-oauth-config` is in your `.mcp.json` args
 - Check that the OAuth JSON file exists at the specified path
@@ -580,7 +615,7 @@ command line and start time still match the recorded PID.
 - If you see `WARNING:Failed to initialize Colab API client`, check the error message
 
 ### Windows: Port blocked error (WinError 10013)
-Already fixed in this mirror (changed to port 8085). If you still hit it, edit `src/colab_mcp/auth.py` and change `OAUTH_SERVER_PORT` to any open port.
+Already fixed in this mirror (a random free loopback port is used; it was 8085 before). If you still hit it, edit `src/colab_mcp/auth.py` and change `OAUTH_SERVER_PORT` to any open port.
 
 ### OAuth says "Access denied"
 Add your Google email as a test user in Cloud Console > OAuth consent screen > Test users.

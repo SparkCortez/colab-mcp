@@ -35,6 +35,13 @@ COLAB_CLIENT_AGENT_HEADER = {
     "value": "python-colab-client",
 }
 COLAB_XSRF_TOKEN_HEADER = {"key": "X-Goog-Colab-Token", "value": ""}
+# Required by the tunnel keep-alive endpoint (colab-vscode src/colab/headers.ts).
+COLAB_TUNNEL_HEADER = {"key": "X-Colab-Tunnel", "value": "Google"}
+
+# Assigning a GPU can take longer than google-auth's 120 s default; Colab keeps
+# provisioning after a client-side timeout, so give it room to answer.
+ASSIGN_TIMEOUT_SECONDS = 300
+REQUEST_TIMEOUT_SECONDS = 60
 
 
 @dataclass
@@ -141,6 +148,13 @@ class Assignment(BaseModel):
     runtime_proxy_token: str
 
 
+class ExistingAssignment(BaseModel):
+    """GET /assign answer when the notebook hash already has a runtime."""
+
+    endpoint: str
+    idle_timeout_sec: Optional[int] = Field(None, alias="fit")
+
+
 class GetAssignmentResponse(BaseModel):
     acc: str = Field(..., alias="acc")
     nbh: str = Field(..., alias="nbh")
@@ -237,6 +251,7 @@ class ColabClient:
         self.logger.debug(f"Headers: {request_headers}")
         self.logger.debug(f"Params: {params}")
 
+        kwargs.setdefault("timeout", REQUEST_TIMEOUT_SECONDS)
         response = self.session.request(
             method, endpoint, headers=request_headers, params=params, **kwargs
         )
@@ -270,6 +285,31 @@ class ColabClient:
         assignments = self._issue_request(url, schema=ListedAssignments)
         return assignments.assignments
 
+    def keep_alive(self, endpoint: str) -> None:
+        """Tell Colab the runtime is in use so it is not reclaimed as idle.
+
+        Mirrors colab-vscode's ``sendKeepAlive`` (GET .../keep-alive/), which
+        the extension sends every 5 minutes while a server is in use.
+        """
+        url = urljoin(self.colab_domain, f"{TUN_ENDPOINT}/{endpoint}/keep-alive/")
+        response = self.session.request(
+            "GET",
+            url,
+            headers={
+                COLAB_TUNNEL_HEADER["key"]: COLAB_TUNNEL_HEADER["value"],
+                COLAB_CLIENT_AGENT_HEADER["key"]: COLAB_CLIENT_AGENT_HEADER["value"],
+            },
+            params={"authuser": "0"},
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        if not response.ok:
+            raise ColabRequestError(
+                f"Keep-alive for {endpoint} failed: {response.status_code} {response.reason}",
+                request=response.request,
+                response=response,
+                response_body=response.text,
+            )
+
     def unassign(self, endpoint: str):
         url = urljoin(self.colab_domain, f"{TUN_ENDPOINT}/unassign/{endpoint}")
         resp = self._issue_request(url, schema=GetUnassignRequest)
@@ -285,7 +325,7 @@ class ColabClient:
         accelerator: Optional[Accelerator] = None,
     ) -> Dict[str, Any]:
         assignment = self._get_assignment(notebook_hash, variant, accelerator)
-        if isinstance(assignment, Assignment):
+        if isinstance(assignment, (Assignment, ExistingAssignment)):
             return {"assignment": assignment, "is_new": False}
 
         try:
@@ -321,9 +361,15 @@ class ColabClient:
         notebook_hash: uuid.UUID,
         variant: Optional[Variant] = None,
         accelerator: Optional[Accelerator] = None,
-    ) -> Union[GetAssignmentResponse, Assignment]:
+    ) -> Union[GetAssignmentResponse, ExistingAssignment]:
+        # Asking again for a notebook hash that already has a runtime returns
+        # that runtime, which makes a retried change_runtime idempotent.
         url = self._build_assign_url(notebook_hash, variant, accelerator)
-        return self._issue_request(url, schema=GetAssignmentResponse)
+        return self._issue_request(
+            url,
+            schema=Union[GetAssignmentResponse, ExistingAssignment],
+            timeout=ASSIGN_TIMEOUT_SECONDS,
+        )
 
     def _post_assignment(
         self,
@@ -335,5 +381,9 @@ class ColabClient:
         url = self._build_assign_url(notebook_hash, variant, accelerator)
         headers = {COLAB_XSRF_TOKEN_HEADER["key"]: xsrf_token}
         return self._issue_request(
-            url, method="POST", headers=headers, schema=PostAssignmentResponse
+            url,
+            method="POST",
+            headers=headers,
+            schema=PostAssignmentResponse,
+            timeout=ASSIGN_TIMEOUT_SECONDS,
         )

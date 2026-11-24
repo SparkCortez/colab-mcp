@@ -69,6 +69,11 @@ class TestDirectTools:
             tools = await client.list_tools()
             tool_names = {t.name for t in tools}
             assert tool_names == {
+                "list_accounts",
+                "set_keep_alive",
+                "add_account",
+                "switch_account",
+                "remove_account",
                 "open_colab_browser_connection",
                 "prepare_colab_browser_connection",
                 "add_code_cell",
@@ -79,6 +84,15 @@ class TestDirectTools:
                 "delete_cell",
                 "move_cell",
                 "change_runtime",
+                "stop_runtime",
+                "list_runtimes",
+                "upload_to_runtime",
+                "download_from_runtime",
+                "create_notebook",
+                "upload_files_to_runtime",
+                "download_files_from_runtime",
+                "list_runtime_files",
+                "delete_runtime_files",
                 "get_colab_connection_info",
                 "run_code_cell_blocking",
                 "get_code_execution",
@@ -373,3 +387,212 @@ class TestColabSessionProxy:
         proxy._exit_stack = AsyncMock()
         await proxy.cleanup()
         proxy._exit_stack.aclose.assert_called_once()
+
+
+class TestStopRuntime:
+    """Tests for the OAuth-backed stop_runtime tool."""
+
+    @staticmethod
+    def _assignment(endpoint, accelerator="T4"):
+        return Mock(endpoint=endpoint, accelerator=Mock(value=accelerator))
+
+    @pytest.mark.asyncio
+    async def test_requires_oauth(self, monkeypatch):
+        import colab_mcp
+        monkeypatch.setattr(colab_mcp, "_colab_client", None)
+        result = await colab_mcp.stop_runtime.fn()
+        assert "not initialized" in result
+
+    @pytest.mark.asyncio
+    async def test_stops_all_and_closes_direct_runtime(self, monkeypatch):
+        import colab_mcp
+        client = Mock()
+        client.list_assignments.return_value = [
+            self._assignment("gpu-a"),
+            self._assignment("cpu-b", "NONE"),
+        ]
+        manager = Mock(endpoint="gpu-a", close=AsyncMock())
+        monkeypatch.setattr(colab_mcp, "_colab_client", client)
+        monkeypatch.setattr(colab_mcp, "_direct_runtime_manager", manager)
+        result = await colab_mcp.stop_runtime.fn(all_runtimes=True)
+        assert [c.args[0] for c in client.unassign.call_args_list] == ["gpu-a", "cpu-b"]
+        manager.close.assert_awaited_once()
+        assert "gpu-a (T4)" in result and "cpu-b (NONE)" in result
+
+    @pytest.mark.asyncio
+    async def test_stops_only_given_endpoint(self, monkeypatch):
+        import colab_mcp
+        client = Mock()
+        client.list_assignments.return_value = [
+            self._assignment("gpu-a"),
+            self._assignment("cpu-b", "NONE"),
+        ]
+        monkeypatch.setattr(colab_mcp, "_colab_client", client)
+        monkeypatch.setattr(colab_mcp, "_direct_runtime_manager", None)
+        await colab_mcp.stop_runtime.fn(runtime_endpoint="cpu-b")
+        client.unassign.assert_called_once_with("cpu-b")
+
+    @pytest.mark.asyncio
+    async def test_unknown_endpoint_and_nothing_active(self, monkeypatch):
+        import colab_mcp
+        client = Mock()
+        client.list_assignments.return_value = []
+        monkeypatch.setattr(colab_mcp, "_colab_client", client)
+        assert "No active Colab runtime to stop" in await colab_mcp.stop_runtime.fn()
+        assert "No active Colab runtime was found" in await colab_mcp.stop_runtime.fn("x")
+        client.unassign.assert_not_called()
+
+
+    @pytest.mark.asyncio
+    async def test_default_stops_only_own_runtime(self, monkeypatch):
+        import colab_mcp
+        client = Mock()
+        client.list_assignments.return_value = [
+            self._assignment("other-session"),
+            self._assignment("mine", "NONE"),
+        ]
+        manager = Mock(endpoint="mine", close=AsyncMock())
+        monkeypatch.setattr(colab_mcp, "_colab_client", client)
+        monkeypatch.setattr(colab_mcp, "_direct_runtime_manager", manager)
+        result = await colab_mcp.stop_runtime.fn()
+        client.unassign.assert_called_once_with("mine")
+        assert "other-session" not in result
+
+    @pytest.mark.asyncio
+    async def test_default_without_own_runtime_stops_nothing(self, monkeypatch):
+        import colab_mcp
+        client = Mock()
+        client.list_assignments.return_value = [self._assignment("other-session")]
+        monkeypatch.setattr(colab_mcp, "_colab_client", client)
+        monkeypatch.setattr(colab_mcp, "_direct_runtime_manager", Mock(endpoint=None))
+        result = await colab_mcp.stop_runtime.fn()
+        client.unassign.assert_not_called()
+        assert "nothing was stopped" in result and "other-session" in result
+
+
+class TestChangeRuntimeScope:
+    @pytest.mark.asyncio
+    async def test_change_runtime_leaves_other_sessions_runtimes(self, monkeypatch):
+        import colab_mcp
+        from colab_mcp.client import Accelerator
+        client = Mock()
+        client.list_assignments.return_value = [
+            Mock(endpoint="mine", accelerator=Accelerator.T4),
+            Mock(endpoint="other", accelerator=Accelerator.T4),
+        ]
+        client.assign.return_value = Mock(endpoint="new", idle_timeout_sec=1800)
+        manager = Mock(endpoint="mine", close=AsyncMock())
+        monkeypatch.setattr(colab_mcp, "_colab_client", client)
+        monkeypatch.setattr(colab_mcp, "_direct_runtime_manager", manager)
+        monkeypatch.setattr(colab_mcp, "_pending_assignments", {})
+        result = await colab_mcp.change_runtime.fn("NONE")
+        client.unassign.assert_called_once_with("mine")
+        manager.note_released.assert_called_once()
+        assert "Released previous runtime mine (T4)" in result
+
+    @pytest.mark.asyncio
+    async def test_change_runtime_reports_too_many_assignments(self, monkeypatch):
+        import colab_mcp
+        from colab_mcp.client import TooManyAssignmentsError
+        client = Mock()
+        client.assign.side_effect = TooManyAssignmentsError("412")
+        client.list_assignments.return_value = [
+            Mock(endpoint="other-gpu", accelerator=Mock(value="T4"))
+        ]
+        monkeypatch.setattr(colab_mcp, "_colab_client", client)
+        monkeypatch.setattr(colab_mcp, "_direct_runtime_manager", Mock(endpoint=None))
+        result = await colab_mcp.change_runtime.fn("T4")
+        client.unassign.assert_not_called()
+        assert "other-gpu (T4)" in result
+
+
+class TestChangeRuntimeIdempotent:
+    @pytest.fixture
+    def env(self, monkeypatch):
+        import colab_mcp
+        from colab_mcp.client import Accelerator
+        client = Mock()
+        client.list_assignments.return_value = [
+            Mock(endpoint="mine", accelerator=Accelerator.T4)
+        ]
+        manager = Mock(
+            endpoint="mine",
+            connected=True,
+            close=AsyncMock(),
+            connect=AsyncMock(),
+            attach_target=AsyncMock(),
+            keep_alive_enabled=True,
+            keep_alive_interval=300,
+            keep_alive_idle_limit=3600,
+        )
+        manager.record.return_value = Mock(idle_timeout_sec=1800)
+        monkeypatch.setattr(colab_mcp, "_colab_client", client)
+        monkeypatch.setattr(colab_mcp, "_direct_runtime_manager", manager)
+        monkeypatch.setattr(colab_mcp, "_pending_assignments", {})
+        return colab_mcp, client, manager
+
+    @pytest.mark.asyncio
+    async def test_reuses_runtime_with_same_accelerator(self, env):
+        colab_mcp, client, manager = env
+        result = await colab_mcp.change_runtime.fn("t4")
+        client.assign.assert_not_called()
+        client.unassign.assert_not_called()
+        assert "reused" in result and "1800 s" in result
+
+    @pytest.mark.asyncio
+    async def test_force_new_assigns_before_releasing(self, env):
+        colab_mcp, client, manager = env
+        calls = []
+        client.assign.side_effect = lambda *a: calls.append("assign") or Mock(
+            endpoint="new", idle_timeout_sec=1800
+        )
+        client.unassign.side_effect = lambda e: calls.append(f"unassign {e}")
+        await colab_mcp.change_runtime.fn("T4", force_new=True)
+        assert calls == ["assign", "unassign mine"]
+
+    @pytest.mark.asyncio
+    async def test_timeout_keeps_runtime_and_retry_reuses_request(self, env):
+        import requests
+        colab_mcp, client, manager = env
+        client.assign.side_effect = requests.exceptions.ReadTimeout("read timed out")
+        result = await colab_mcp.change_runtime.fn("L4")
+        client.unassign.assert_not_called()
+        assert "mine (T4) was not touched" in result and "again" in result
+        first_hash = client.assign.call_args.args[0]
+        client.assign.side_effect = None
+        client.assign.return_value = {"assignment": Mock(endpoint="new", idle_timeout_sec=None), "is_new": False}
+        await colab_mcp.change_runtime.fn("L4")
+        assert client.assign.call_args.args[0] == first_hash
+        assert colab_mcp._pending_assignments == {}
+
+    @pytest.mark.asyncio
+    async def test_too_many_releases_own_then_retries(self, env):
+        from colab_mcp.client import TooManyAssignmentsError
+        colab_mcp, client, manager = env
+        client.assign.side_effect = [
+            TooManyAssignmentsError("412"),
+            Mock(endpoint="new", idle_timeout_sec=600),
+        ]
+        result = await colab_mcp.change_runtime.fn("L4")
+        client.unassign.assert_called_once_with("mine")
+        assert "Released previous runtime mine" in result and "new" in result
+
+    @pytest.mark.asyncio
+    async def test_bad_gateway_is_reported_as_temporary(self, env):
+        from colab_mcp.client import ColabRequestError
+        colab_mcp, client, manager = env
+        response = Mock(status_code=502, reason="Bad Gateway")
+        client.assign.side_effect = ColabRequestError("502", None, response)
+        result = await colab_mcp.change_runtime.fn("L4")
+        client.unassign.assert_not_called()
+        assert "HTTP 502" in result and "mine (T4) was not touched" in result
+        assert colab_mcp._pending_assignments
+
+    @pytest.mark.asyncio
+    async def test_client_errors_are_not_retried_silently(self, env):
+        from colab_mcp.client import ColabRequestError
+        colab_mcp, client, manager = env
+        response = Mock(status_code=403, reason="Forbidden")
+        client.assign.side_effect = ColabRequestError("403 Forbidden", None, response)
+        result = await colab_mcp.change_runtime.fn("L4")
+        assert result.startswith("Failed to change runtime") and "403" in result
