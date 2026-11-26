@@ -25,6 +25,9 @@ import sys
 import time
 import uuid
 import webbrowser
+import weakref
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 from fastmcp import FastMCP
 from fastmcp.utilities import logging as fastmcp_logger
@@ -46,7 +49,26 @@ from colab_mcp.session import ColabSessionProxy, NOT_CONNECTED_MSG
 from colab_mcp import process_registry
 
 
-mcp = FastMCP(name="ColabMCP")
+class _NoDocketFastMCP(FastMCP):
+    """FastMCP without the Docket background-task worker.
+
+    No tool here uses background tasks, and fastmcp 2.14's default in-memory
+    Docket (fakeredis) wakes every 10 ms while idle, costing ~3% CPU per
+    server instance.
+    """
+
+    @asynccontextmanager
+    async def _docket_lifespan(self) -> AsyncIterator[None]:
+        from fastmcp.server.dependencies import _current_server
+
+        token = _current_server.set(weakref.ref(self))
+        try:
+            yield
+        finally:
+            _current_server.reset(token)
+
+
+mcp = _NoDocketFastMCP(name="ColabMCP")
 
 # These will be set during main_async() startup
 _proxy_client = None
