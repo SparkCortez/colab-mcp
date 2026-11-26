@@ -35,7 +35,7 @@ def tools(monkeypatch, tmp_path):
 
     runtime = LocalRuntime()
 
-    async def connected():
+    async def connected(runtime_endpoint=""):
         return runtime
 
     monkeypatch.setattr(colab_mcp, "_connected_direct_runtime", connected)

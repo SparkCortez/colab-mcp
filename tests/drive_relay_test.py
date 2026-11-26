@@ -133,7 +133,7 @@ def tools(monkeypatch, drive):
 
     runtime = FakeRuntime()
 
-    async def connected():
+    async def connected(runtime_endpoint=""):
         return runtime
 
     monkeypatch.setattr(colab_mcp, "_connected_direct_runtime", connected)
@@ -143,7 +143,7 @@ def tools(monkeypatch, drive):
 
 @pytest.mark.asyncio
 async def test_auto_uses_drive_for_large_files_when_granted(tmp_path, tools, drive, monkeypatch):
-    monkeypatch.setattr(tools, "_drive_session_for_transfer", lambda force: drive)
+    monkeypatch.setattr(tools, "_drive_session_for_transfer", lambda force, account=None: drive)
     big, small = tmp_path / "big.bin", tmp_path / "small.bin"
     big.write_bytes(os.urandom(5000))
     small.write_bytes(b"tiny")
@@ -158,7 +158,7 @@ async def test_auto_uses_drive_for_large_files_when_granted(tmp_path, tools, dri
 
 @pytest.mark.asyncio
 async def test_auto_falls_back_to_kernel_without_drive_access(tmp_path, tools, monkeypatch):
-    monkeypatch.setattr(tools, "_drive_session_for_transfer", lambda force: None)
+    monkeypatch.setattr(tools, "_drive_session_for_transfer", lambda force, account=None: None)
     big = tmp_path / "big.bin"
     big.write_bytes(os.urandom(5000))
     result = await tools.upload_to_runtime.fn(str(big), str(tmp_path / "r.bin"))
@@ -168,7 +168,7 @@ async def test_auto_falls_back_to_kernel_without_drive_access(tmp_path, tools, m
 
 @pytest.mark.asyncio
 async def test_auto_falls_back_when_drive_fails_but_forced_drive_reports(tmp_path, tools, monkeypatch):
-    def broken(force):
+    def broken(force, account=None):
         raise RuntimeError("drive down")
 
     monkeypatch.setattr(tools, "_drive_session_for_transfer", broken)
@@ -183,7 +183,7 @@ async def test_auto_falls_back_when_drive_fails_but_forced_drive_reports(tmp_pat
 
 @pytest.mark.asyncio
 async def test_batch_upload_reports_route(tmp_path, tools, drive, monkeypatch):
-    monkeypatch.setattr(tools, "_drive_session_for_transfer", lambda force: drive)
+    monkeypatch.setattr(tools, "_drive_session_for_transfer", lambda force, account=None: drive)
     folder = tmp_path / "clips"
     folder.mkdir()
     (folder / "a.bin").write_bytes(os.urandom(20000))

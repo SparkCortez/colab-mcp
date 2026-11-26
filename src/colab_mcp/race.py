@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Ask several accounts for a runtime at once and keep the first one.
+"""Ask several accounts for a runtime at once and keep the first one (or first N).
 
 Free GPUs are scarce: one account may get 503s or a POST that Colab holds
 open for minutes while another gets a runtime at once.  ``race`` starts an
@@ -113,8 +113,11 @@ class Race:
         retry_delays: tuple[float, ...] | None = None,
         late_check_seconds: float | None = None,
         clock: Callable[[], float] = time.monotonic,
+        count: int = 1,
     ):
         self.entrants = entrants
+        # How many runtimes to keep, each from a different account.
+        self.count = max(1, min(count, len(entrants) or 1))
         self.variant = variant
         self.accelerator = accelerator
         self.deadline_seconds = deadline_seconds
@@ -123,7 +126,7 @@ class Race:
             LATE_CHECK_SECONDS if late_check_seconds is None else late_check_seconds
         )
         self.clock = clock
-        self.winner: Entrant | None = None
+        self.winners: list[Entrant] = []
         self.closed = False
         self.decided = asyncio.Event()
         self.started = clock()
@@ -131,15 +134,31 @@ class Race:
         self.cleanups: list[asyncio.Task] = []
 
     @property
-    def over(self) -> bool:
-        return self.winner is not None or self.clock() - self.started >= self.deadline_seconds
+    def winner(self) -> Entrant | None:
+        return self.winners[0] if self.winners else None
 
-    async def run(self) -> Entrant | None:
-        """Wait until a winner exists or every entrant has given up."""
+    @property
+    def full(self) -> bool:
+        return len(self.winners) >= self.count
+
+    @property
+    def over(self) -> bool:
+        return self.full or self.clock() - self.started >= self.deadline_seconds
+
+    def _why_stopped(self) -> str:
+        if self.full:
+            return "another account won" if self.count == 1 else f"{self.count} runtimes were already found"
+        return "deadline reached"
+
+    async def run(self) -> list[Entrant]:
+        """Wait until ``count`` winners exist, the deadline passes or everyone gave up.
+
+        Returns the winners in arrival order (possibly fewer than ``count``).
+        """
         self.tasks = [asyncio.create_task(self._enter(e)) for e in self.entrants]
         waiter = asyncio.create_task(self.decided.wait())
         pending = set(self.tasks) | {waiter}
-        while self.winner is None and any(not t.done() for t in self.tasks):
+        while not self.full and any(not t.done() for t in self.tasks):
             remaining = self.deadline_seconds - (self.clock() - self.started)
             if remaining <= 0:
                 break
@@ -149,7 +168,7 @@ class Race:
         waiter.cancel()
         # From here on nobody can win: a request Colab still answers is released.
         self.closed = True
-        return self.winner
+        return list(self.winners)
 
     async def finish(self) -> None:
         """Wait for every losing attempt and its late check (background use)."""
@@ -181,30 +200,31 @@ class Race:
                         await self._sleep_unless_decided(delay)
                         continue
                     entrant.outcome = _describe(exc) if not self.over else (
-                        "stopped: " + ("another account won" if self.winner else "deadline reached")
+                        "stopped: " + self._why_stopped()
                     )
                     return
                 endpoint, fit = _endpoint_and_fit(result)
                 entrant.endpoint, entrant.fit = endpoint, fit
                 entrant.seconds = self.clock() - self.started
-                if self.winner is None and not self.closed:
-                    self.winner = entrant
-                    entrant.outcome = "won"
-                    self.decided.set()
+                if not self.full and not self.closed:
+                    self.winners.append(entrant)
+                    entrant.outcome = "won" if self.count == 1 else f"won (#{len(self.winners)})"
+                    if self.full:
+                        self.decided.set()
                     return
                 entrant.outcome = (
-                    "got a runtime after another account won; released it"
-                    if self.winner is not None
-                    else "got a runtime after the deadline; released it"
+                    "got a runtime after the deadline; released it"
+                    if not self.full
+                    else "got a runtime after another account won; released it"
+                    if self.count == 1
+                    else f"got a runtime after {self.count} were found; released it"
                 )
                 await self._release(entrant, endpoint)
                 return
             if entrant.outcome == "waiting" or entrant.outcome.startswith("retrying"):
-                entrant.outcome = "stopped: " + (
-                    "another account won" if self.winner else "deadline reached"
-                )
+                entrant.outcome = "stopped: " + self._why_stopped()
         finally:
-            if self.winner is not entrant:
+            if entrant not in self.winners:
                 self.cleanups.append(asyncio.create_task(self._late_check(entrant)))
 
     async def _sleep_unless_decided(self, delay: float) -> None:

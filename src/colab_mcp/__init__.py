@@ -441,19 +441,38 @@ async def get_cells() -> str:
 
 
 @mcp.tool()
-async def run_code_cell(cellId: str = "", code: str = "") -> dict[str, object]:
+async def run_code_cell(cellId: str = "", code: str = "", runtime_endpoint: str = "") -> dict[str, object]:
     """Start code in the background and return an execution ID.
 
     This is the default execution path, so the MCP client remains available
     while any cell runs. If a direct OAuth-backed runtime is connected, pass
     ``code`` and execution/output streaming happen without a browser. The
     ``cellId`` form remains available through the browser notebook bridge.
+    ``runtime_endpoint`` (optional, with ``code``) runs it on that runtime
+    instead of this session's one; it may be on any signed-in account, and the
+    session's runtime does not change.
     """
     if not cellId and not code:
         return {
             "status": "failed",
             "error": "cellId or code is required to start a background code execution.",
         }
+    if runtime_endpoint:
+        if not code:
+            return {"status": "failed", "error": "runtime_endpoint requires the code argument."}
+        got = await _runtime_kernel(runtime_endpoint, side=False)
+        if isinstance(got, str):
+            return {"status": "failed", "error": got}
+        target_runtime = got[0]
+
+        async def endpoint_runner(publish) -> str:
+            outputs = await target_runtime.execute(code, publish)
+            return json.dumps(outputs, ensure_ascii=False)
+
+        try:
+            return await _execution_registry.start(f"<{runtime_endpoint}>", endpoint_runner)
+        except Exception as exc:  # pragma: no cover - defensive server boundary
+            return {"status": "failed", "error": str(exc)}
     if code and _direct_runtime_manager is not None and not _direct_runtime_manager.connected:
         try:
             await _direct_runtime_manager.connect()
@@ -510,14 +529,23 @@ async def run_code_cell(cellId: str = "", code: str = "") -> dict[str, object]:
 
 
 @mcp.tool()
-async def run_code_cell_blocking(cellId: str = "", code: str = "") -> str:
+async def run_code_cell_blocking(cellId: str = "", code: str = "", runtime_endpoint: str = "") -> str:
     """Execute a code cell and wait for its final browser-side result.
 
     Prefer run_code_cell for long-running work so the MCP client remains
     available while the cell executes. This blocking variant preserves the
     previous behavior for short cells and callers that need the result in the
-    same tool response.
+    same tool response. runtime_endpoint (optional, with code) runs it on that
+    runtime instead of this session's one, on any signed-in account.
     """
+    if runtime_endpoint:
+        if not code:
+            return "runtime_endpoint requires the code argument."
+        got = await _runtime_kernel(runtime_endpoint, side=False)
+        if isinstance(got, str):
+            return got
+        outputs = await got[0].execute(code, lambda _event: None)
+        return json.dumps(outputs, ensure_ascii=False)
     if code and _direct_runtime_manager is not None and not _direct_runtime_manager.connected:
         try:
             await _direct_runtime_manager.connect()
@@ -753,10 +781,13 @@ async def race_runtime(
     accounts: list[str] | None = None,
     timeout_minutes: float = 10,
     force_new: bool = False,
+    count: int = 1,
 ) -> str:
     """Ask every signed-in account (or the given accounts) for a runtime at the same time and keep the first one Colab hands out; this session then switches to that account and connects to it directly.
 
-    Temporary errors (502/503, timeouts) are retried on each account until timeout_minutes. Requests still waiting when an account wins are wound down in the background: any runtime they get later is stopped at once, so only the winning runtime stays. Accounts that already have their maximum runtimes are skipped, and runtimes other sessions use are never stopped. If this session already has a runtime with that accelerator it is reused unless force_new=true; a different previous runtime of this session is released after the winner is connected. Requires OAuth setup.
+    Temporary errors (502/503, timeouts) are retried on each account until timeout_minutes. Requests still waiting when an account wins are wound down in the background: any runtime they get later is stopped at once, so only the winning runtime stays. Accounts that already have their maximum runtimes are skipped, and runtimes other sessions use are never stopped.
+
+    count > 1 keeps the first count runtimes, each from a different account: the first becomes this session's runtime, the others stay connected (with keep-alive) and are used by passing their endpoint as runtime_endpoint to run_shell, run_code_cell, the file tools, etc. If fewer arrive before the deadline, the ones found are kept. If this session already has a runtime with that accelerator it is reused unless force_new=true; a different previous runtime of this session is released after the winner is connected. Requires OAuth setup.
     """
     from colab_mcp import auth
     from colab_mcp.client import Accelerator, Variant
@@ -772,6 +803,7 @@ async def race_runtime(
     prev_client, prev_manager, prev_account = _colab_client, _direct_runtime_manager, _active_account
 
     prev_own = None
+    count = max(1, int(count))
     if prev_client is not None and prev_manager is not None:
         own_endpoint = prev_manager.endpoint or prev_manager.last_endpoint
         try:
@@ -779,7 +811,7 @@ async def race_runtime(
         except Exception:
             listed = []
         prev_own = next((a for a in listed if a.endpoint == own_endpoint), None)
-        if prev_own is not None and prev_own.accelerator == acc and not force_new:
+        if prev_own is not None and prev_own.accelerator == acc and not force_new and count == 1:
             if not (prev_manager.connected and prev_manager.endpoint == prev_own.endpoint):
                 await prev_manager.connect(prev_own.endpoint)
             return (
@@ -800,8 +832,9 @@ async def race_runtime(
     if not entrants:
         return json.dumps({"winner": None, "accounts": skipped}, indent=2)
 
-    race = Race(entrants, variant, acc, max(0.0, timeout_minutes) * 60)
-    winner = await race.run()
+    race = Race(entrants, variant, acc, max(0.0, timeout_minutes) * 60, count=count)
+    winners = await race.run()
+    winner = winners[0] if winners else None
     _background_races.add(race)
     finish = asyncio.ensure_future(race.finish())
     finish.add_done_callback(lambda _f: _background_races.discard(race))
@@ -843,6 +876,24 @@ async def race_runtime(
         report["winner"]["direct_connected"] = False
         report["winner"]["connect_error"] = str(e)
 
+    extra = []
+    for other in winners[1:]:
+        row = {"account": other.email, "endpoint": other.endpoint, "seconds": round(other.seconds or 0, 1)}
+        try:
+            other_manager = DirectRuntimeManager(other.client, _keep_alive_interval, _keep_alive_idle_limit)
+            await other_manager.connect(other.endpoint)
+            other_manager.note_assigned(other.endpoint, acc.value, other.fit)
+            _endpoint_managers[other.endpoint] = (other.email, other_manager)
+            row["direct_connected"] = True
+        except Exception as e:
+            row["direct_connected"] = False
+            row["connect_error"] = str(e)
+        extra.append(row)
+    if count > 1:
+        report["runtimes"] = [{**report["winner"], "session_default": True}] + extra
+        if len(winners) < count:
+            report["shortfall"] = f"Only {len(winners)} of {count} runtimes arrived within {timeout_minutes:g} min; kept those."
+
     if prev_own is not None and prev_own.endpoint != winner.endpoint:
         try:
             report["previous_runtime"] = (
@@ -856,6 +907,7 @@ async def race_runtime(
     report["accounts"] = [e.summary() for e in entrants] + skipped
     report["note"] = (
         f"This session now uses {winner.email}. "
+        + (f"Use the other runtimes with runtime_endpoint=<endpoint>. " if extra else "")
         + ("Other accounts' pending requests are being stopped in the background; any runtime "
            "they still get is released. " if any(not t.done() for t in race.tasks) else "")
         + _keep_alive_summary(manager)
@@ -865,9 +917,25 @@ async def race_runtime(
 
 @mcp.tool()
 async def stop_runtime(runtime_endpoint: str = "", all_runtimes: bool = False) -> str:
-    """Stop (unassign) a Colab runtime so it stops consuming compute quota. By default stops only the runtime this MCP session is connected to; pass runtime_endpoint for a specific one, or all_runtimes=true to stop every runtime on the account (including ones other sessions are using). Requires OAuth setup."""
+    """Stop (unassign) a Colab runtime so it stops consuming compute quota. By default stops only the runtime this MCP session is connected to; pass runtime_endpoint for a specific one (on any signed-in account), or all_runtimes=true to stop every runtime on the active account (including ones other sessions are using). Requires OAuth setup."""
     if _colab_client is None:
         return "Runtime API not initialized. Start with --client-oauth-config flag pointing to your OAuth client secrets JSON."
+    if runtime_endpoint and not all_runtimes:
+        ep = runtime_endpoint.strip()
+        try:
+            found = await _find_runtime(ep)
+            if found is None:
+                return f"No active Colab runtime was found for endpoint '{ep}' on any signed-in account."
+            email, client, assignment = found
+            for _email, manager in _managers_for_endpoint(ep):
+                manager.note_released(ep, "stop_runtime")
+                if manager.endpoint == ep:
+                    await manager.close()
+            _endpoint_managers.pop(ep, None)
+            await asyncio.to_thread(client.unassign, ep)
+            return f"Stopped runtime(s): {ep} ({assignment.accelerator.value}) on {email}"
+        except Exception as e:
+            return f"Failed to stop runtime: {e}"
     try:
         assignments = await asyncio.to_thread(_colab_client.list_assignments)
         assignments = assignments or []
@@ -900,6 +968,7 @@ async def stop_runtime(runtime_endpoint: str = "", all_runtimes: bool = False) -
                 _direct_runtime_manager.note_released(a.endpoint, "stop_runtime")
                 if _direct_runtime_manager.endpoint == a.endpoint:
                     await _direct_runtime_manager.close()
+            await _drop_endpoint_manager(a.endpoint)
             await asyncio.to_thread(_colab_client.unassign, a.endpoint)
             stopped.append(f"{a.endpoint} ({a.accelerator.value})")
         return "Stopped runtime(s): " + ", ".join(stopped)
@@ -1101,28 +1170,134 @@ async def remove_account(email: str) -> str:
     return f"Removed {email}. Other running MCP sessions that already loaded it keep working until they restart."
 
 
-async def _connected_direct_runtime():
-    """Return the runtime's side kernel for file and shell tools, or an error string.
+# Direct connections to runtimes other than the session's own, opened by
+# tools called with runtime_endpoint: endpoint -> (account, manager).  Each has
+# its own keep-alive; the session's default runtime is not changed.
+_endpoint_managers: dict[str, tuple[str, DirectRuntimeManager]] = {}
 
-    The side kernel is a second kernel on the same runtime, so these tools keep
-    working while a cell occupies the main kernel.  If it cannot be started the
-    main kernel is used instead.
-    """
-    manager = _direct_runtime_manager
-    if manager is None:
-        return "Direct runtime access requires --client-oauth-config."
-    if not manager.connected:
+
+async def _find_runtime(endpoint: str):
+    """Search every signed-in account for a runtime; (email, client, assignment) or None."""
+    from colab_mcp import auth
+
+    async def look(email):
         try:
-            await manager.connect()
+            client, _manager = await asyncio.to_thread(_account_pair, email)
+            for a in await asyncio.to_thread(client.list_assignments) or []:
+                if a.endpoint == endpoint:
+                    return email, client, a
+        except Exception:
+            logging.getLogger(__name__).debug("Lookup on %s failed", email, exc_info=True)
+        return None
+
+    # The active account first: it is the usual owner and needs no other token.
+    if _colab_client is not None:
+        try:
+            for a in await asyncio.to_thread(_colab_client.list_assignments) or []:
+                if a.endpoint == endpoint:
+                    return _active_account, _colab_client, a
+        except Exception:
+            logging.getLogger(__name__).debug("Lookup on the active account failed", exc_info=True)
+    others = [e for e in auth.list_saved_accounts() if e != _active_account] if _client_oauth_config else []
+    for found in await asyncio.gather(*(look(e) for e in others)):
+        if found is not None:
+            return found
+    return None
+
+
+def _managers_for_endpoint(endpoint: str):
+    """Every loaded (account, manager) attached to ``endpoint``."""
+    seen = []
+    for email, (_client, manager) in _accounts.items():
+        if manager.endpoint == endpoint or manager.last_endpoint == endpoint:
+            seen.append((email, manager))
+    if endpoint in _endpoint_managers:
+        seen.append(_endpoint_managers[endpoint])
+    if _direct_runtime_manager is not None and all(m is not _direct_runtime_manager for _e, m in seen):
+        if _direct_runtime_manager.endpoint == endpoint:
+            seen.append((_active_account, _direct_runtime_manager))
+    return seen
+
+
+async def _manager_for(runtime_endpoint: str = ""):
+    """(account, manager) for the session's runtime or a given endpoint, or an error string."""
+    if not runtime_endpoint:
+        if _direct_runtime_manager is None:
+            return "Direct runtime access requires --client-oauth-config."
+        return _active_account, _direct_runtime_manager
+    ep = runtime_endpoint.strip()
+    session = _direct_runtime_manager
+    if session is not None and ep in (session.endpoint, session.last_endpoint):
+        return _active_account, session
+    if ep in _endpoint_managers:
+        return _endpoint_managers[ep]
+    for email, (_client, manager) in _accounts.items():
+        if manager.endpoint == ep:
+            return email, manager
+    if not _client_oauth_config:
+        return "Direct runtime access requires --client-oauth-config."
+    found = await _find_runtime(ep)
+    if found is None:
+        return (
+            f"No runtime '{ep}' was found on any signed-in account. "
+            "list_accounts shows every account's runtimes."
+        )
+    email, client, _assignment = found
+    manager = DirectRuntimeManager(client, _keep_alive_interval, _keep_alive_idle_limit)
+    _endpoint_managers[ep] = (email, manager)
+    return email, manager
+
+
+async def _drop_endpoint_manager(endpoint: str) -> None:
+    entry = _endpoint_managers.pop(endpoint, None)
+    if entry is not None:
+        await entry[1].close()
+
+
+async def _runtime_kernel(runtime_endpoint: str = "", side: bool = True):
+    """Kernel for a tool call: (runtime, account), or an error string.
+
+    Without runtime_endpoint this is the session's runtime.  side=True returns
+    the runtime's side kernel, a second kernel on the same runtime, so file and
+    shell tools keep working while a cell occupies the main kernel (the main
+    kernel is used if the side kernel cannot be started).
+    """
+    got = await _manager_for(runtime_endpoint)
+    if isinstance(got, str):
+        return got
+    account, manager = got
+    ep = runtime_endpoint.strip()
+    if not manager.connected or (ep and manager.endpoint != ep):
+        try:
+            await manager.connect(ep)
         except DirectRuntimeError as exc:
+            if ep:
+                await _drop_endpoint_manager(ep)
             return f"Direct Colab runtime connection failed: {exc}"
+    if not side:
+        return manager.runtime, account
     try:
-        return await manager.side()
+        return await manager.side(), account
     except Exception:
         logging.getLogger(__name__).warning(
             "Side kernel unavailable; using the main kernel", exc_info=True
         )
-        return manager.runtime
+        return manager.runtime, account
+
+
+async def _connected_direct_runtime(runtime_endpoint: str = ""):
+    """The side kernel of the session's runtime or of runtime_endpoint, or an error string."""
+    got = await _runtime_kernel(runtime_endpoint)
+    return got if isinstance(got, str) else got[0]
+
+
+def _runtime_account(runtime_endpoint: str = "") -> str | None:
+    """Account that owns a runtime this process is connected to."""
+    ep = runtime_endpoint.strip()
+    if ep:
+        for email, _manager in _managers_for_endpoint(ep):
+            return email
+    return _active_account
 
 
 def _shell_result(outputs) -> dict:
@@ -1137,6 +1312,7 @@ async def run_shell(
     cwd: str = "/content",
     timeout_seconds: float = 300,
     background: bool = False,
+    runtime_endpoint: str = "",
 ) -> str:
     """Run a bash command on the directly connected runtime and return stdout, stderr and exit_code as JSON.
 
@@ -1145,12 +1321,14 @@ async def run_shell(
     A foreground command is killed after timeout_seconds (timed_out: true, partial output kept); only the last 20000 characters of each stream are returned. Shell commands share one side kernel, so a long foreground command delays the next one.
 
     background=True starts the command detached and returns a job_id at once; its output goes to a log file. Use shell_job to read its state and log tail, list jobs or kill one. Background jobs survive the MCP session but not the runtime.
+
+    runtime_endpoint (optional) runs the command on that runtime instead of this session's one; it may be on any signed-in account, and the session's runtime does not change.
     """
     from colab_mcp import shell
 
     if not command.strip():
         return "command is empty."
-    runtime = await _connected_direct_runtime()
+    runtime = await _connected_direct_runtime(runtime_endpoint)
     if isinstance(runtime, str):
         return runtime
     try:
@@ -1172,10 +1350,12 @@ async def run_shell(
 
 
 @mcp.tool()
-async def shell_job(job_id: str = "", action: str = "status", tail_lines: int = 50) -> str:
+async def shell_job(
+    job_id: str = "", action: str = "status", tail_lines: int = 50, runtime_endpoint: str = ""
+) -> str:
     """Inspect background jobs started by run_shell(background=True).
 
-    action="status" (default) returns state (running / exited / killed), exit_code, elapsed seconds and the last tail_lines of the log. action="list" lists every job on the runtime (job_id may be empty). action="kill" stops the job's whole process group (SIGTERM, then SIGKILL).
+    action="status" (default) returns state (running / exited / killed), exit_code, elapsed seconds and the last tail_lines of the log. action="list" lists every job on the runtime (job_id may be empty). action="kill" stops the job's whole process group (SIGTERM, then SIGKILL). Pass the same runtime_endpoint the job was started with.
     """
     from colab_mcp import shell
 
@@ -1183,7 +1363,7 @@ async def shell_job(job_id: str = "", action: str = "status", tail_lines: int = 
         return "action must be 'status', 'list' or 'kill'."
     if action != "list" and not job_id:
         return f"job_id is required for action '{action}'."
-    runtime = await _connected_direct_runtime()
+    runtime = await _connected_direct_runtime(runtime_endpoint)
     if isinstance(runtime, str):
         return runtime
     if action == "list":
@@ -1199,8 +1379,8 @@ async def shell_job(job_id: str = "", action: str = "status", tail_lines: int = 
         return f"shell_job failed: {e}"
 
 
-def _drive_session_for_transfer(force: bool):
-    """Drive session of the active account for relaying files, or None.
+def _drive_session_for_transfer(force: bool, account: str | None = None):
+    """Drive session of ``account`` (default: the active one) for relaying files, or None.
 
     Without ``force`` only an account that already granted Drive access is
     used, so a transfer never stops to wait for a consent screen.
@@ -1209,9 +1389,10 @@ def _drive_session_for_transfer(force: bool):
 
     if not _client_oauth_config:
         return None
-    if _active_account:
-        token_path = auth.account_drive_token_path(_active_account)
-        kwargs = {"token_path": token_path, "login_hint": _active_account}
+    account = account or _active_account
+    if account:
+        token_path = auth.account_drive_token_path(account)
+        kwargs = {"token_path": token_path, "login_hint": account}
     else:
         token_path = auth.DRIVE_TOKEN_CONFIG_PATH
         kwargs = {}
@@ -1225,7 +1406,7 @@ def _route_note(route: str, size: int, seconds: float, note: str = "") -> str:
     return f"via {route}, {rate:.2f} MB/s" + (f"; {note}" if note else "")
 
 
-async def _push(runtime, source: str, remote_path: str, via: str) -> tuple[int, str]:
+async def _push(runtime, source: str, remote_path: str, via: str, account: str | None = None) -> tuple[int, str]:
     """Send a local file to the runtime by Drive or kernel; return (size, route note)."""
     from colab_mcp import drive_relay, transfer
 
@@ -1234,7 +1415,7 @@ async def _push(runtime, source: str, remote_path: str, via: str) -> tuple[int, 
     note = ""
     if via == "drive" or (via == "auto" and size >= drive_relay.DRIVE_THRESHOLD_BYTES):
         try:
-            session = await asyncio.to_thread(_drive_session_for_transfer, via == "drive")
+            session = await asyncio.to_thread(_drive_session_for_transfer, via == "drive", account)
             if session is not None:
                 written = await drive_relay.push_file(runtime, session, source, remote_path)
                 return written, _route_note("Google Drive", written, time.monotonic() - started)
@@ -1248,7 +1429,7 @@ async def _push(runtime, source: str, remote_path: str, via: str) -> tuple[int, 
     return written, _route_note("kernel", written, time.monotonic() - started, note)
 
 
-async def _pull(runtime, remote_path: str, target: str, via: str) -> tuple[int | None, str]:
+async def _pull(runtime, remote_path: str, target: str, via: str, account: str | None = None) -> tuple[int | None, str]:
     """Fetch a runtime file by Drive or kernel; (None, "") if it does not exist."""
     from colab_mcp import drive_relay, transfer
 
@@ -1260,7 +1441,7 @@ async def _pull(runtime, remote_path: str, target: str, via: str) -> tuple[int |
     note = ""
     if via == "drive" or (via == "auto" and size >= drive_relay.DRIVE_THRESHOLD_BYTES):
         try:
-            session = await asyncio.to_thread(_drive_session_for_transfer, via == "drive")
+            session = await asyncio.to_thread(_drive_session_for_transfer, via == "drive", account)
             if session is not None:
                 received = await drive_relay.pull_file(runtime, session, remote_path, target)
                 return received, _route_note("Google Drive", received, time.monotonic() - started)
@@ -1278,11 +1459,11 @@ _VIA_CHOICES = ("auto", "drive", "kernel")
 
 
 @mcp.tool()
-async def upload_to_runtime(local_path: str, remote_path: str = "", via: str = "auto") -> str:
-    """Copy a local file to the directly connected Colab runtime (default destination /content/<file name>); no browser is needed. For several files or a directory use upload_files_to_runtime. via: 'auto' (default) relays files of 20 MB or more through Google Drive (several times faster than the kernel) when this account has granted Drive access, else uses the kernel; 'drive' forces Drive (asks for Drive consent once); 'kernel' forces the kernel route (1 GiB max)."""
+async def upload_to_runtime(local_path: str, remote_path: str = "", via: str = "auto", runtime_endpoint: str = "") -> str:
+    """Copy a local file to the directly connected Colab runtime (default destination /content/<file name>); no browser is needed. For several files or a directory use upload_files_to_runtime. via: 'auto' (default) relays files of 20 MB or more through Google Drive (several times faster than the kernel) when this account has granted Drive access, else uses the kernel; 'drive' forces Drive (asks for Drive consent once); 'kernel' forces the kernel route (1 GiB max). runtime_endpoint (optional) targets that runtime instead of this session's one; it may be on any signed-in account, and the session's runtime does not change."""
     if via not in _VIA_CHOICES:
         return f"via must be one of {', '.join(_VIA_CHOICES)}."
-    runtime = await _connected_direct_runtime()
+    runtime = await _connected_direct_runtime(runtime_endpoint)
     if isinstance(runtime, str):
         return runtime
     source = os.path.expanduser(local_path)
@@ -1290,25 +1471,25 @@ async def upload_to_runtime(local_path: str, remote_path: str = "", via: str = "
         return f"Local file not found: {local_path}"
     remote_path = remote_path or f"/content/{os.path.basename(source)}"
     try:
-        written, route = await _push(runtime, source, remote_path, via)
+        written, route = await _push(runtime, source, remote_path, via, _runtime_account(runtime_endpoint))
         return f"Uploaded {local_path} to {remote_path} ({written} bytes, {route})."
     except Exception as e:
         return f"Failed to upload {local_path}: {e}"
 
 
 @mcp.tool()
-async def download_from_runtime(remote_path: str, local_path: str = "", via: str = "auto") -> str:
-    """Copy a file from the directly connected Colab runtime to this machine (default destination ~/Downloads/colab/<file name>); no browser is needed. For several files, globs or a directory use download_files_from_runtime. via: 'auto' (default) relays files of 20 MB or more through Google Drive (several times faster than the kernel) when this account has granted Drive access, else uses the kernel; 'drive' forces Drive (asks for Drive consent once); 'kernel' forces the kernel route (1 GiB max)."""
+async def download_from_runtime(remote_path: str, local_path: str = "", via: str = "auto", runtime_endpoint: str = "") -> str:
+    """Copy a file from the directly connected Colab runtime to this machine (default destination ~/Downloads/colab/<file name>); no browser is needed. For several files, globs or a directory use download_files_from_runtime. via: 'auto' (default) relays files of 20 MB or more through Google Drive (several times faster than the kernel) when this account has granted Drive access, else uses the kernel; 'drive' forces Drive (asks for Drive consent once); 'kernel' forces the kernel route (1 GiB max). runtime_endpoint (optional) targets that runtime instead of this session's one; it may be on any signed-in account, and the session's runtime does not change."""
     if via not in _VIA_CHOICES:
         return f"via must be one of {', '.join(_VIA_CHOICES)}."
-    runtime = await _connected_direct_runtime()
+    runtime = await _connected_direct_runtime(runtime_endpoint)
     if isinstance(runtime, str):
         return runtime
     target = os.path.expanduser(
         local_path or os.path.join("~/Downloads/colab", os.path.basename(remote_path))
     )
     try:
-        size, route = await _pull(runtime, remote_path, target, via)
+        size, route = await _pull(runtime, remote_path, target, via, _runtime_account(runtime_endpoint))
         if size is None:
             return f"Remote file not found: {remote_path}"
         return f"Downloaded {remote_path} to {target} ({size} bytes, {route})."
@@ -1317,14 +1498,14 @@ async def download_from_runtime(remote_path: str, local_path: str = "", via: str
 
 
 @mcp.tool()
-async def upload_files_to_runtime(local_paths: list[str], remote_dir: str = "/content", via: str = "auto") -> str:
-    """Upload several local files and/or directories (glob patterns and ~ allowed) to remote_dir on the directly connected runtime in one compressed transfer. Each entry keeps its base name; directories are copied recursively. via: 'auto' (default) relays files of 20 MB or more through Google Drive (several times faster than the kernel) when this account has granted Drive access, else uses the kernel; 'drive' forces Drive (asks for Drive consent once); 'kernel' forces the kernel route (1 GiB max)."""
+async def upload_files_to_runtime(local_paths: list[str], remote_dir: str = "/content", via: str = "auto", runtime_endpoint: str = "") -> str:
+    """Upload several local files and/or directories (glob patterns and ~ allowed) to remote_dir on the directly connected runtime in one compressed transfer. Each entry keeps its base name; directories are copied recursively. via: 'auto' (default) relays files of 20 MB or more through Google Drive (several times faster than the kernel) when this account has granted Drive access, else uses the kernel; 'drive' forces Drive (asks for Drive consent once); 'kernel' forces the kernel route (1 GiB max). runtime_endpoint (optional) targets that runtime instead of this session's one; it may be on any signed-in account, and the session's runtime does not change."""
     import uuid
     from colab_mcp import transfer
 
     if via not in _VIA_CHOICES:
         return f"via must be one of {', '.join(_VIA_CHOICES)}."
-    runtime = await _connected_direct_runtime()
+    runtime = await _connected_direct_runtime(runtime_endpoint)
     if isinstance(runtime, str):
         return runtime
     if not local_paths:
@@ -1335,7 +1516,7 @@ async def upload_files_to_runtime(local_paths: list[str], remote_dir: str = "/co
         with tempfile.TemporaryDirectory(prefix="colab-mcp-") as workdir:
             archive = os.path.join(workdir, "batch.tar.gz")
             await asyncio.to_thread(transfer.pack_local, sources, archive)
-            size, route = await _push(runtime, archive, remote_archive, via)
+            size, route = await _push(runtime, archive, remote_archive, via, _runtime_account(runtime_endpoint))
         outputs = await runtime.execute(
             transfer.remote_unpack_code(remote_archive, remote_dir), lambda _event: None
         )
@@ -1353,14 +1534,14 @@ async def upload_files_to_runtime(local_paths: list[str], remote_dir: str = "/co
 
 
 @mcp.tool()
-async def download_files_from_runtime(remote_paths: list[str], local_dir: str = "~/Downloads/colab", via: str = "auto") -> str:
-    """Download several runtime files and/or directories (glob patterns allowed, e.g. /content/outputs/*.png) into local_dir in one compressed transfer. Each match keeps its base name; directories are copied recursively. via: 'auto' (default) relays files of 20 MB or more through Google Drive (several times faster than the kernel) when this account has granted Drive access, else uses the kernel; 'drive' forces Drive (asks for Drive consent once); 'kernel' forces the kernel route (1 GiB max)."""
+async def download_files_from_runtime(remote_paths: list[str], local_dir: str = "~/Downloads/colab", via: str = "auto", runtime_endpoint: str = "") -> str:
+    """Download several runtime files and/or directories (glob patterns allowed, e.g. /content/outputs/*.png) into local_dir in one compressed transfer. Each match keeps its base name; directories are copied recursively. via: 'auto' (default) relays files of 20 MB or more through Google Drive (several times faster than the kernel) when this account has granted Drive access, else uses the kernel; 'drive' forces Drive (asks for Drive consent once); 'kernel' forces the kernel route (1 GiB max). runtime_endpoint (optional) targets that runtime instead of this session's one; it may be on any signed-in account, and the session's runtime does not change."""
     import uuid
     from colab_mcp import transfer
 
     if via not in _VIA_CHOICES:
         return f"via must be one of {', '.join(_VIA_CHOICES)}."
-    runtime = await _connected_direct_runtime()
+    runtime = await _connected_direct_runtime(runtime_endpoint)
     if isinstance(runtime, str):
         return runtime
     if not remote_paths:
@@ -1376,7 +1557,7 @@ async def download_files_from_runtime(remote_paths: list[str], local_dir: str = 
             return f"No remote files matched: {', '.join(report['missing'])}"
         with tempfile.TemporaryDirectory(prefix="colab-mcp-") as workdir:
             archive = os.path.join(workdir, "batch.tar.gz")
-            size, route = await _pull(runtime, remote_archive, archive, via)
+            size, route = await _pull(runtime, remote_archive, archive, via, _runtime_account(runtime_endpoint))
             names = await asyncio.to_thread(transfer.unpack_local, archive, dest)
         return json.dumps(
             {
@@ -1398,11 +1579,11 @@ async def download_files_from_runtime(remote_paths: list[str], local_dir: str = 
 
 
 @mcp.tool()
-async def list_runtime_files(path: str = "/content", recursive: bool = False, limit: int = 500) -> str:
-    """List files on the directly connected runtime with type, size in bytes and UTC modification time. recursive walks subdirectories; at most limit entries are returned."""
+async def list_runtime_files(path: str = "/content", recursive: bool = False, limit: int = 500, runtime_endpoint: str = "") -> str:
+    """List files on the directly connected runtime with type, size in bytes and UTC modification time. recursive walks subdirectories; at most limit entries are returned. runtime_endpoint (optional) targets that runtime instead of this session's one; it may be on any signed-in account, and the session's runtime does not change."""
     from colab_mcp import transfer
 
-    runtime = await _connected_direct_runtime()
+    runtime = await _connected_direct_runtime(runtime_endpoint)
     if isinstance(runtime, str):
         return runtime
     try:
@@ -1418,11 +1599,11 @@ async def list_runtime_files(path: str = "/content", recursive: bool = False, li
 
 
 @mcp.tool()
-async def delete_runtime_files(remote_paths: list[str]) -> str:
-    """Delete files and/or directories (recursively) on the directly connected runtime. Glob patterns are allowed; the result lists what was deleted and which patterns matched nothing."""
+async def delete_runtime_files(remote_paths: list[str], runtime_endpoint: str = "") -> str:
+    """Delete files and/or directories (recursively) on the directly connected runtime. Glob patterns are allowed; the result lists what was deleted and which patterns matched nothing. runtime_endpoint (optional) targets that runtime instead of this session's one; it may be on any signed-in account, and the session's runtime does not change."""
     from colab_mcp import transfer
 
-    runtime = await _connected_direct_runtime()
+    runtime = await _connected_direct_runtime(runtime_endpoint)
     if isinstance(runtime, str):
         return runtime
     if not remote_paths:

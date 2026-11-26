@@ -192,7 +192,7 @@ even before a browser has connected; notebook calls return an explicit
 | `download_files_from_runtime` | No | Yes | Download several runtime files/directories (globs allowed) into `local_dir` as one compressed batch |
 | `list_runtime_files` | No | Yes | List runtime files with type, size and modification time (optionally recursive) |
 | `delete_runtime_files` | No | Yes | Delete runtime files/directories matching paths or globs |
-| `race_runtime` | | Yes | Ask every signed-in account for a runtime at once, keep the first one Colab hands out (the session switches to that account) and stop every other one |
+| `race_runtime` | | Yes | Ask every signed-in account for a runtime at once, keep the first one (or first `count`, one per account) Colab hands out and stop every other one; the session switches to the first |
 | `run_shell` | No | Yes | Run a bash command on the runtime (stdout, stderr, exit code; timeout kills the process group), or start it as a background job; works while a cell is running |
 | `shell_job` | No | Yes | Status and log tail of a background job, list jobs, or kill one |
 | `create_notebook` | No | Yes | Create a Colab notebook in Drive (optional cells and default GPU); first call asks for `drive.file` consent |
@@ -592,6 +592,10 @@ The kernel route sends base64 through one websocket to a runtime that is often o
 ### Getting a GPU faster with several accounts
 
 When free T4s are scarce, one account may get HTTP 503 or a request Colab holds open for minutes while another gets a runtime at once. `race_runtime("T4")` sends the request from every signed-in account (or `accounts=[...]`) at the same time, retries 502/503/timeouts until `timeout_minutes` (default 10), and keeps the first runtime Colab hands out: the session switches to that account and connects to it. Every other request is wound down. Ones still waiting on Colab cannot be interrupted, so any runtime they get later is stopped as soon as it arrives, and each account's notebook hash is checked again two minutes after its request ends in case Colab finished it anyway. Only runtimes created by the race are stopped; runtimes other sessions use on those accounts are left alone. Measured with CPU runtimes on 8 accounts: winner after 3.8 s, all others stopped, nothing else left running.
+
+### Using several runtimes at once
+
+`run_shell`, `shell_job`, `run_code_cell(_blocking)` (with `code`), the file listing/deletion tools and the four transfer tools take an optional `runtime_endpoint`. With it the call runs on that runtime instead of the session's one; the endpoint is looked up on every signed-in account, a separate direct connection (with its own keep-alive) is opened and reused, and the session's runtime and active account do not change. Transfers use the Drive token of the account that owns the runtime. `stop_runtime(runtime_endpoint=...)` also finds the owning account. `race_runtime("T4", count=3)` prepares three runtimes on three different accounts in one call: the first becomes the session's runtime and the others are listed in `runtimes` for use with `runtime_endpoint`.
 
 ### Running shell commands while a cell is busy
 

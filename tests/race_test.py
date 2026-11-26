@@ -77,7 +77,7 @@ def make_race(clients, deadline=5.0, late=0.05):
 async def test_fastest_account_wins_and_slow_one_is_released_when_it_arrives():
     fast, slow = FakeColab("fast", [(0.05, "ok")]), FakeColab("slow", [(0.4, "ok")])
     race, entrants = make_race([slow, fast])
-    winner = await race.run()
+    winner = (await race.run() or [None])[0]
     assert winner.email == "fast"
     assert winner.endpoint == "fast-1"
     assert slow.unassigned == []  # still waiting on Colab
@@ -92,7 +92,7 @@ async def test_temporary_errors_are_retried_until_success():
     flaky = FakeColab("flaky", [http_error(503), http_error(502), "ok"])
     full = FakeColab("full", [TooManyAssignmentsError("412")])
     race, entrants = make_race([flaky, full])
-    winner = await race.run()
+    winner = (await race.run() or [None])[0]
     assert winner.email == "flaky" and flaky.calls == 3
     assert "too many runtimes" in entrants[1].outcome
     await race.finish()
@@ -104,7 +104,7 @@ async def test_permanent_error_drops_only_that_account():
     denied = FakeColab("denied", [http_error(403)])
     ok = FakeColab("ok", [(0.1, "ok")])
     race, entrants = make_race([denied, ok])
-    winner = await race.run()
+    winner = (await race.run() or [None])[0]
     assert winner.email == "ok"
     assert entrants[0].outcome == "HTTP 403 Err" and denied.calls == 1
 
@@ -115,7 +115,7 @@ async def test_no_winner_before_deadline():
     b = FakeColab("b", [http_error(503)] * 100)
     race, entrants = make_race([a, b], deadline=0.3)
     started = time.monotonic()
-    assert await race.run() is None
+    assert await race.run() == []
     assert time.monotonic() - started < 2
     assert all(e.outcome == "stopped: deadline reached" for e in entrants)
 
@@ -125,7 +125,7 @@ async def test_runtime_created_after_a_client_timeout_is_released():
     late = FakeColab("late", [(0.1, "late")])
     winner_client = FakeColab("win", [(0.02, "ok")])
     race, entrants = make_race([late, winner_client], late=0.05)
-    assert (await race.run()).email == "win"
+    assert (await race.run())[0].email == "win"
     await race.finish()
     assert late.unassigned == ["late-late"]
     assert entrants[0].outcome == "stopped: another account won"
@@ -260,8 +260,33 @@ async def test_deadline_is_kept_even_while_a_request_hangs():
     hanging = FakeColab("hang", [(0.8, "ok")])
     race, entrants = make_race([hanging], deadline=0.2)
     started = time.monotonic()
-    assert await race.run() is None
+    assert await race.run() == []
     assert time.monotonic() - started < 0.6
     await race.finish()
     assert hanging.unassigned == ["hang-1"]
     assert entrants[0].outcome == "got a runtime after the deadline; released it"
+
+
+@pytest.mark.asyncio
+async def test_count_keeps_first_n_and_releases_the_rest():
+    a, b, c = FakeColab("a", [(0.05, "ok")]), FakeColab("b", [(0.1, "ok")]), FakeColab("c", [(0.3, "ok")])
+    entrants = [Entrant(x.name, x) for x in (c, b, a)]
+    race = Race(entrants, Variant.GPU, Accelerator.T4, 5, retry_delays=(0.05,), late_check_seconds=0.05, count=2)
+    winners = await race.run()
+    assert [w.email for w in winners] == ["a", "b"]
+    assert [w.outcome for w in winners] == ["won (#1)", "won (#2)"]
+    await race.finish()
+    assert c.unassigned == ["c-1"] and a.unassigned == b.unassigned == []
+    assert entrants[0].outcome == "got a runtime after 2 were found; released it"
+
+
+@pytest.mark.asyncio
+async def test_count_keeps_partial_result_at_deadline():
+    a = FakeColab("a", [(0.05, "ok")])
+    b = FakeColab("b", [http_error(503)] * 100)
+    race, _ = make_race([a, b], deadline=0.3)
+    race.count = 2
+    winners = await race.run()
+    assert [w.email for w in winners] == ["a"]
+    await race.finish()
+    assert a.unassigned == []
