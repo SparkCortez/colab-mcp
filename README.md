@@ -32,7 +32,7 @@ available for notebook UI operations and compatibility.
 - 既存のColabタブへ手動接続するための明示的な準備（ブラウザを開かずColab入力用の`TOKEN&PORT`を取得）
 - OAuthを設定した場合のT4、L4、A100、NONEランタイムの割り当て
 
-現在のMCPツールは30個です。アカウント管理4個、接続3個、セル操作6個、実行・状態確認4個、ランタイム管理4個（変更・停止・一覧・keep-alive）、ファイル転送・管理6個、シェル2個（`run_shell`・`shell_job`、セル実行中も使える別カーネル）、ノートブック作成1個で構成されます。既存タブへ手動接続する場合は`prepare_colab_browser_connection`を呼び、返された`TOKEN&PORT`文字列をColabの「MCPプロキシトークン」欄へ入力します。このツールはブラウザを開かず、接続完了まで待ちません。セル追加の`cellIndex`は必須で、`-1`を指定すると末尾へ追加します。省略した場合は実行されません。セル操作では`add_code_cell`または`get_cells`で得た`cellId`を使います。標準の`run_code_cell`はすぐに`execution_id`を返し、従来どおり完了まで待つ必要がある場合だけ`run_code_cell_blocking`を使います。
+現在のMCPツールは31個です。アカウント管理4個、接続3個、セル操作6個、実行・状態確認4個、ランタイム管理5個（変更・全アカウント競争取得・停止・一覧・keep-alive）、ファイル転送・管理6個、シェル2個（`run_shell`・`shell_job`、セル実行中も使える別カーネル）、ノートブック作成1個で構成されます。既存タブへ手動接続する場合は`prepare_colab_browser_connection`を呼び、返された`TOKEN&PORT`文字列をColabの「MCPプロキシトークン」欄へ入力します。このツールはブラウザを開かず、接続完了まで待ちません。セル追加の`cellIndex`は必須で、`-1`を指定すると末尾へ追加します。省略した場合は実行されません。セル操作では`add_code_cell`または`get_cells`で得た`cellId`を使います。標準の`run_code_cell`はすぐに`execution_id`を返し、従来どおり完了まで待つ必要がある場合だけ`run_code_cell_blocking`を使います。
 
 ### 公式版との比較・このミラーの改善
 
@@ -159,7 +159,7 @@ retains incremental kernel output in a bounded event buffer; poll
 `get_code_execution` with `cursor` (and optionally `wait_seconds`) to read new
 output without waiting for the cell to finish.
 
-There are 30 registered tools. They are available to the MCP client at startup,
+There are 31 registered tools. They are available to the MCP client at startup,
 even before a browser has connected; notebook calls return an explicit
 `COLAB_NOT_CONNECTED` message until a connection is established.
 
@@ -192,6 +192,7 @@ even before a browser has connected; notebook calls return an explicit
 | `download_files_from_runtime` | No | Yes | Download several runtime files/directories (globs allowed) into `local_dir` as one compressed batch |
 | `list_runtime_files` | No | Yes | List runtime files with type, size and modification time (optionally recursive) |
 | `delete_runtime_files` | No | Yes | Delete runtime files/directories matching paths or globs |
+| `race_runtime` | | Yes | Ask every signed-in account for a runtime at once, keep the first one Colab hands out (the session switches to that account) and stop every other one |
 | `run_shell` | No | Yes | Run a bash command on the runtime (stdout, stderr, exit code; timeout kills the process group), or start it as a background job; works while a cell is running |
 | `shell_job` | No | Yes | Status and log tail of a background job, list jobs, or kill one |
 | `create_notebook` | No | Yes | Create a Colab notebook in Drive (optional cells and default GPU); first call asks for `drive.file` consent |
@@ -215,7 +216,7 @@ optional capabilities:
 
 | Area | Official baseline | This mirror |
 |------|-------------------|-------------|
-| Tool discovery | Notebook tools appear after browser connection and may require `notifications/tools/list_changed` | All 30 tools are registered at process startup |
+| Tool discovery | Notebook tools appear after browser connection and may require `notifications/tools/list_changed` | All 31 tools are registered at process startup |
 | Existing notebooks and tabs | Connection flow primarily opens a new URL/tab | Accepts an existing HTTPS `notebook_url`; `open_new_tab=false` prepares a URL for an existing tab |
 | Process lifecycle | A stale process can leave a tab pointed at a dead port | Registry + OS process scan; PID, start time, command, and profile are checked before cleanup, and timed-out peers are marked for safe retry cleanup |
 | Local browser connection | `localhost` dual-stack binding and missing PNA response headers can make Chrome fail to reach the server | IPv4-only `127.0.0.1` binding plus PNA/CORS headers on preflight and WebSocket upgrade |
@@ -587,6 +588,10 @@ command line and start time still match the recorded PID.
 ### Large file transfers are slow
 
 The kernel route sends base64 through one websocket to a runtime that is often on another continent (measured 0.75 MB/s upload from Indonesia on a 3.8 MB/s line). The four upload/download tools therefore take `via`: with `auto` (default) files of 20 MB or more go laptop ↔ Google Drive ↔ runtime when the active account has granted Drive (`drive.file`) access, with the temporary Drive file deleted afterwards (measured 2.6 MB/s up, 2.8 MB/s down for 64 MB). `via="drive"` grants that access once; `via="kernel"` forces the old route.
+
+### Getting a GPU faster with several accounts
+
+When free T4s are scarce, one account may get HTTP 503 or a request Colab holds open for minutes while another gets a runtime at once. `race_runtime("T4")` sends the request from every signed-in account (or `accounts=[...]`) at the same time, retries 502/503/timeouts until `timeout_minutes` (default 10), and keeps the first runtime Colab hands out: the session switches to that account and connects to it. Every other request is wound down. Ones still waiting on Colab cannot be interrupted, so any runtime they get later is stopped as soon as it arrives, and each account's notebook hash is checked again two minutes after its request ends in case Colab finished it anyway. Only runtimes created by the race are stopped; runtimes other sessions use on those accounts are left alone. Measured with CPU runtimes on 8 accounts: winner after 3.8 s, all others stopped, nothing else left running.
 
 ### Running shell commands while a cell is busy
 

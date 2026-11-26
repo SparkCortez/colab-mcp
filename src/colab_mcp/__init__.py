@@ -597,7 +597,7 @@ async def _release_runtime(client, manager, endpoint: str, accelerator: str, by:
 
 @mcp.tool()
 async def change_runtime(accelerator: str = "T4", force_new: bool = False) -> str:
-    """Get a Colab runtime with the given accelerator (NONE, T4, L4, A100) and connect to it directly. Idempotent: if this session's runtime already has that accelerator it is reused (force_new=true replaces it). The old runtime is released only after the new one exists. If Colab is slow and the call times out, calling it again resumes the same request instead of creating a second runtime. Only this session's runtime is ever replaced. Requires OAuth setup."""
+    """Get a Colab runtime with the given accelerator (NONE, T4, L4, A100) and connect to it directly. Idempotent: if this session's runtime already has that accelerator it is reused (force_new=true replaces it). The old runtime is released only after the new one exists. If Colab is slow and the call times out, calling it again resumes the same request instead of creating a second runtime. Only this session's runtime is ever replaced. To try every signed-in account at once and keep the fastest, use race_runtime. Requires OAuth setup."""
     if _colab_client is None:
         return "Runtime API not initialized. Start with --client-oauth-config flag pointing to your OAuth client secrets JSON."
     from colab_mcp.client import (
@@ -740,6 +740,127 @@ async def change_runtime(accelerator: str = "T4", force_new: bool = False) -> st
             )
         except Exception as e:
             return f"Failed to change runtime: {e}"
+
+
+# Races whose losing attempts are still being wound down; kept referenced so
+# their background tasks are not garbage-collected.
+_background_races: set = set()
+
+
+@mcp.tool()
+async def race_runtime(
+    accelerator: str = "T4",
+    accounts: list[str] | None = None,
+    timeout_minutes: float = 10,
+    force_new: bool = False,
+) -> str:
+    """Ask every signed-in account (or the given accounts) for a runtime at the same time and keep the first one Colab hands out; this session then switches to that account and connects to it directly.
+
+    Temporary errors (502/503, timeouts) are retried on each account until timeout_minutes. Requests still waiting when an account wins are wound down in the background: any runtime they get later is stopped at once, so only the winning runtime stays. Accounts that already have their maximum runtimes are skipped, and runtimes other sessions use are never stopped. If this session already has a runtime with that accelerator it is reused unless force_new=true; a different previous runtime of this session is released after the winner is connected. Requires OAuth setup.
+    """
+    from colab_mcp import auth
+    from colab_mcp.client import Accelerator, Variant
+    from colab_mcp.race import Entrant, Race
+
+    if not _client_oauth_config:
+        return "Runtime API not initialized. Start with --client-oauth-config flag pointing to your OAuth client secrets JSON."
+    try:
+        acc = Accelerator(accelerator.upper())
+    except ValueError:
+        return f"Unknown accelerator '{accelerator}'. Use NONE, T4, L4 or A100."
+    variant = Variant.GPU if acc != Accelerator.NONE else Variant.DEFAULT
+    prev_client, prev_manager, prev_account = _colab_client, _direct_runtime_manager, _active_account
+
+    prev_own = None
+    if prev_client is not None and prev_manager is not None:
+        own_endpoint = prev_manager.endpoint or prev_manager.last_endpoint
+        try:
+            listed = await asyncio.to_thread(prev_client.list_assignments) or []
+        except Exception:
+            listed = []
+        prev_own = next((a for a in listed if a.endpoint == own_endpoint), None)
+        if prev_own is not None and prev_own.accelerator == acc and not force_new:
+            if not (prev_manager.connected and prev_manager.endpoint == prev_own.endpoint):
+                await prev_manager.connect(prev_own.endpoint)
+            return (
+                f"This session already has a {acc.value} runtime ({prev_own.endpoint}) on "
+                f"{prev_account}; reused it. Pass force_new=true to race for a new one."
+            )
+
+    saved = auth.list_saved_accounts()
+    wanted = [e.strip().lower() for e in accounts] if accounts else saved
+    unknown = [e for e in wanted if e not in saved]
+    entrants, skipped = [], [{"account": e, "outcome": "not signed in"} for e in unknown]
+    for email in [e for e in wanted if e in saved]:
+        try:
+            client, _manager = await asyncio.to_thread(_account_pair, email)
+            entrants.append(Entrant(email, client))
+        except Exception as e:
+            skipped.append({"account": email, "outcome": f"could not load: {e}"})
+    if not entrants:
+        return json.dumps({"winner": None, "accounts": skipped}, indent=2)
+
+    race = Race(entrants, variant, acc, max(0.0, timeout_minutes) * 60)
+    winner = await race.run()
+    _background_races.add(race)
+    finish = asyncio.ensure_future(race.finish())
+    finish.add_done_callback(lambda _f: _background_races.discard(race))
+
+    report: dict[str, object] = {}
+    if winner is None:
+        report["winner"] = None
+        report["accounts"] = [e.summary() for e in entrants] + skipped
+        report["note"] = (
+            f"No account got a {acc.value} runtime within {timeout_minutes:g} min. "
+            "The session's account and runtime are unchanged."
+        )
+        return json.dumps(report, indent=2)
+
+    _activate_account(winner.email)
+    client, manager = _colab_client, _direct_runtime_manager
+    report["winner"] = {
+        "account": winner.email,
+        "endpoint": winner.endpoint,
+        "seconds": round(winner.seconds or 0, 1),
+        "idle_timeout_sec": winner.fit,
+    }
+    try:
+        listed = await asyncio.to_thread(client.list_assignments) or []
+        selected = next((a for a in listed if a.endpoint == winner.endpoint), None)
+        if selected is not None:
+            await manager.attach_target(
+                RuntimeTarget(
+                    endpoint=selected.endpoint,
+                    url=selected.runtime_proxy_info.url,
+                    token=selected.runtime_proxy_info.token,
+                )
+            )
+            manager.note_assigned(winner.endpoint, acc.value, winner.fit)
+            report["winner"]["direct_connected"] = True
+        else:
+            report["winner"]["direct_connected"] = False
+    except Exception as e:
+        report["winner"]["direct_connected"] = False
+        report["winner"]["connect_error"] = str(e)
+
+    if prev_own is not None and prev_own.endpoint != winner.endpoint:
+        try:
+            report["previous_runtime"] = (
+                await _release_runtime(
+                    prev_client, prev_manager, prev_own.endpoint,
+                    prev_own.accelerator.value, f"race_runtime to {acc.value}",
+                )
+            ).strip()
+        except Exception as e:
+            report["previous_runtime"] = f"Could not release {prev_own.endpoint}: {e}"
+    report["accounts"] = [e.summary() for e in entrants] + skipped
+    report["note"] = (
+        f"This session now uses {winner.email}. "
+        + ("Other accounts' pending requests are being stopped in the background; any runtime "
+           "they still get is released. " if any(not t.done() for t in race.tasks) else "")
+        + _keep_alive_summary(manager)
+    )
+    return json.dumps(report, indent=2)
 
 
 @mcp.tool()

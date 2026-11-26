@@ -99,6 +99,7 @@ class TestDirectTools:
                 "list_code_executions",
                 "run_shell",
                 "shell_job",
+                "race_runtime",
             }
 
     @pytest.mark.asyncio
